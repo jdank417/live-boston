@@ -184,6 +184,9 @@ export interface Vehicle {
   speed: number | null;
   status: VehicleStatus;
   stopName?: string;
+  /** Where the stop it's at or heading to is, for capping dead reckoning. */
+  stopLng?: number;
+  stopLat?: number;
   /** Cars in the consist, when reported. */
   carriages: number | null;
   /** Epoch ms of this position report. */
@@ -197,7 +200,7 @@ export async function loadVehicles(): Promise<Vehicle[]> {
     'fields[vehicle]':
       'label,latitude,longitude,bearing,speed,current_status,direction_id,carriages,updated_at',
     'fields[trip]': 'headsign,name,shape',
-    'fields[stop]': 'name',
+    'fields[stop]': 'name,latitude,longitude',
   });
   const trips = index(doc, 'trip');
   const stops = index(doc, 'stop');
@@ -207,6 +210,7 @@ export async function loadVehicles(): Promise<Vehicle[]> {
       const a = v.attributes;
       const tripId = rel(v, 'trip');
       const trip = tripId ? trips.get(tripId) : undefined;
+      const stop = stops.get(rel(v, 'stop') ?? '');
       return {
         id: v.id,
         label: a.label,
@@ -221,7 +225,9 @@ export async function loadVehicles(): Promise<Vehicle[]> {
         bearing: a.bearing ?? null,
         speed: a.speed ?? null,
         status: a.current_status,
-        stopName: stops.get(rel(v, 'stop') ?? '')?.attributes.name,
+        stopName: stop?.attributes.name,
+        stopLng: stop?.attributes.longitude,
+        stopLat: stop?.attributes.latitude,
         carriages: a.carriages?.length || null,
         updatedAt: time(a.updated_at),
       };

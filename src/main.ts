@@ -135,6 +135,8 @@ interface Train {
   tx: number;
   ty: number;
   speed: number | null;
+  /** Along-track distance of the stop it's at or heading to, if it's on the track ahead. */
+  stopD: number | null;
   /** How far the last report was from the track, in meters. */
   off: number;
   /** Filled in each frame. */
@@ -154,13 +156,52 @@ const color = (hex: string) => {
   return c;
 };
 
-type Selection = { kind: 'train'; id: string } | { kind: 'station'; id: string } | null;
+type Selection =
+  | { kind: 'train'; id: string }
+  | { kind: 'station'; id: string }
+  | { kind: 'following'; id?: undefined }
+  | null;
 let selection: Selection = null;
 type CameraMode = 'free' | 'follow' | 'ride';
 let cameraMode: CameraMode = 'free';
 let rideBearing = 0;
 let touring = false;
 let tourNext = 0;
+/** Opened a train from the Following tab, so its card offers a way back. */
+let backToFollowing = false;
+
+// Saved per device. Storage can be unavailable (private mode), so every
+// access is guarded and the app works without it.
+function load<T>(key: string, fallback: T): T {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw ? (JSON.parse(raw) as T) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+function save(key: string, value: unknown) {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch {
+    // Not saved; it still works for this visit.
+  }
+}
+
+/** A train you follow, with enough to describe it while it's out of service. */
+interface Followed {
+  id: string;
+  routeId: string;
+  label: string;
+}
+const FOLLOWING_KEY = 'live-boston:following';
+let followed: Followed[] = load(FOLLOWING_KEY, []);
+const isFollowed = (id: string) => followed.some((f) => f.id === id);
+
+type ViewMode = '2d' | '3d';
+const VIEW_KEY = 'live-boston:view';
+let viewMode: ViewMode = load<ViewMode>(VIEW_KEY, '3d') === '2d' ? '2d' : '3d';
+const flat = () => viewMode === '2d';
 
 // ---------------------------------------------------------------------------
 // Style
@@ -312,8 +353,15 @@ function addLayers() {
     },
     paint: {
       'icon-color': ['get', 'color'],
-      'icon-halo-color': ['case', ['get', 'selected'], '#ffffff', 'rgba(255,255,255,0.75)'],
-      'icon-halo-width': ['case', ['get', 'selected'], 2.5, 1],
+      'icon-halo-color': [
+        'case',
+        ['get', 'selected'],
+        '#ffffff',
+        ['get', 'followed'],
+        '#ffd166',
+        'rgba(255,255,255,0.75)',
+      ],
+      'icon-halo-width': ['case', ['any', ['get', 'selected'], ['get', 'followed']], 2.5, 1],
       // The 3D trains take over as you zoom in.
       'icon-opacity': ['interpolate', ['linear'], ['zoom'], 14, 1, 15, 0],
     },
@@ -437,11 +485,13 @@ function applyReport(v: Vehicle, now: number) {
       tx: x,
       ty: y,
       speed: v.speed,
+      stopD: null,
       off: snapped?.off ?? Infinity,
       x,
       y,
       heading,
     });
+    locateStop(trains.get(v.id)!);
     return;
   }
 
@@ -449,13 +499,29 @@ function applyReport(v: Vehicle, now: number) {
   const interval = v.updatedAt - t.v.updatedAt;
   if (snapped) {
     const moved = snapped.d - t.to;
-    // Speed from the MBTA when it has one, otherwise from distance along the track.
-    t.speed = v.speed ?? (interval > 3000 && interval < 120_000 ? Math.max(0, moved) / (interval / 1000) : t.speed);
+    // Speed from the MBTA when it has one, otherwise from distance along the
+    // track, smoothed so one short hop doesn't swing it.
+    if (v.speed != null) t.speed = v.speed;
+    else if (interval > 3000 && interval < 120_000) {
+      const measured = Math.max(0, moved) / (interval / 1000);
+      t.speed = t.speed == null ? measured : t.speed * 0.4 + measured * 0.6;
+    }
     if (moved > -40 || moved < -1500) {
-      t.from = t.d;
-      t.to = snapped.d;
+      // Glide until the next poll lands, so there's no pause before it. If
+      // dead reckoning already carried the train past this report, wait for
+      // reality to catch up rather than slide backwards.
+      if (snapped.d < t.d && snapped.d > t.d - 400) {
+        // Ahead of the report: keep rolling from here, but slower, since the
+        // train is evidently going slower than estimated.
+        t.from = t.to = t.d;
+        t.dur = 1;
+        if (t.speed != null) t.speed *= 0.6;
+      } else {
+        t.from = t.d;
+        t.to = snapped.d;
+        t.dur = POLL_MS + 500;
+      }
       t.start = now;
-      t.dur = Math.min(15_000, Math.max(4000, interval || POLL_MS));
     }
     // A small step backwards is position noise; hold rather than reverse.
   } else {
@@ -468,6 +534,41 @@ function applyReport(v: Vehicle, now: number) {
   }
   t.off = snapped?.off ?? Infinity;
   t.v = v;
+  locateStop(t);
+}
+
+/** Running speeds between stations (m/s), for a train before its speed is measured. */
+const TYPICAL_SPEED: Record<string, number> = {
+  Red: 11,
+  Orange: 11,
+  Blue: 10,
+  Green: 6,
+  Mattapan: 6,
+  CR: 20,
+};
+
+/** Finds the train's current or next stop on its track, to cap dead reckoning there. */
+function locateStop(t: Train) {
+  t.stopD = null;
+  if (!t.track || t.v.stopLng == null || t.v.stopLat == null) return;
+  const [sx, sy] = toLocal(t.v.stopLng, t.v.stopLat);
+  const p = t.track.project(sx, sy, t.to);
+  if (p.off < 150) t.stopD = p.d;
+}
+
+/**
+ * How far a train has probably gone since its glide ended. About a quarter of
+ * moving trains go a poll or more without a new report; rather than freeze
+ * them, keep them rolling at their measured speed, but never past the stop
+ * they're heading to, and not at all if they're stopped.
+ */
+function coast(t: Train, ms: number) {
+  const speed = t.speed ?? TYPICAL_SPEED[t.group] ?? 8;
+  if (ms <= 0 || t.v.status === 'STOPPED_AT' || speed < 0.5) return 0;
+  let limit = t.to + 600;
+  if (t.stopD != null && t.stopD > t.to) limit = Math.min(limit, t.stopD);
+  else if (t.stopD != null) return 0; // At or past its stop already.
+  return Math.max(0, Math.min(limit - t.to, (speed * Math.min(ms, 90_000)) / 1000));
 }
 
 async function poll() {
@@ -486,7 +587,7 @@ async function poll() {
     lastUpdate = Date.now();
     setNotice(null);
     renderDock();
-    if (selection?.kind === 'train') renderPanel();
+    if (selection?.kind === 'train' || selection?.kind === 'following') renderPanel();
   } catch (err) {
     handleError(err, 'Can’t reach the MBTA right now, retrying');
   }
@@ -519,7 +620,7 @@ function exaggeration(zoom: number) {
   return { width: Math.min(10, 2 ** k), length: Math.min(3, 2 ** (k / 2)), height: Math.min(3.2, 2 ** (k / 2)) };
 }
 
-function layout(train: Train, s: ReturnType<typeof exaggeration>, selected: boolean) {
+function layout(train: Train, s: ReturnType<typeof exaggeration>, selected: boolean, starred: boolean) {
   const front = { x: 0, y: 0 };
   const back = { x: 0, y: 0 };
   const half = (train.length * s.length) / 2;
@@ -559,6 +660,7 @@ function layout(train: Train, s: ReturnType<typeof exaggeration>, selected: bool
       front: i === 0,
       rear: i === train.cars.length - 1,
       selected,
+      followed: starred,
     });
     carOwners.push(train.v.id);
     offset += len + GAP * s.length;
@@ -578,14 +680,14 @@ function frame() {
   for (const t of trains.values()) {
     const k = Math.min(1, (now - t.start) / t.dur);
     if (t.track) {
-      t.d = t.from + (t.to - t.from) * k;
+      t.d = k < 1 ? t.from + (t.to - t.from) * k : t.to + coast(t, now - t.start - t.dur);
     } else {
       t.x = t.fx + (t.tx - t.fx) * k;
       t.y = t.fy + (t.ty - t.fy) * k;
       if (t.v.bearing != null) t.heading = ((90 - t.v.bearing) * Math.PI) / 180;
     }
     if (hidden.has(t.group)) continue;
-    layout(t, s, t.v.id === selectedId);
+    layout(t, s, t.v.id === selectedId, isFollowed(t.v.id));
   }
 
   trainLayer.setCars(zoom >= 12.5 ? frameCars : []);
@@ -607,6 +709,7 @@ function drawIcons(selectedId: string | null) {
         color: `#${t.accent.getHexString()}`,
         bearing: compass(t.heading),
         selected: t.v.id === selectedId,
+        followed: isFollowed(t.v.id),
         rail: t.route.type === 2,
       },
       geometry: { type: 'Point', coordinates: toLngLat(t.x, t.y) },
@@ -649,13 +752,18 @@ function setCameraMode(mode: CameraMode) {
     map.easeTo({
       center: toLngLat(t.x, t.y),
       zoom: t.route.type === 2 ? 17.4 : 18,
-      pitch: 72,
+      pitch: flat() ? 0 : 72,
       bearing: rideBearing,
       duration: 2200,
       essential: true,
     });
   } else if (t && mode === 'follow') {
-    map.easeTo({ center: toLngLat(t.x, t.y), zoom: Math.max(map.getZoom(), 15.5), pitch: 55, duration: 1500 });
+    map.easeTo({
+      center: toLngLat(t.x, t.y),
+      zoom: Math.max(map.getZoom(), 15.5),
+      pitch: flat() ? 0 : 55,
+      duration: 1500,
+    });
   }
   renderPanel();
 }
@@ -838,13 +946,16 @@ let refreshTimer: number | undefined;
 function select(next: Selection, keepTour = false) {
   if (!keepTour) setTouring(false);
   if (next?.kind === selection?.kind && next?.id === selection?.id) return;
+  backToFollowing = selection?.kind === 'following' && next?.kind === 'train';
   selection = next;
   upcoming = null;
   departures = null;
   clearInterval(refreshTimer);
   if (cameraMode !== 'free' && !keepTour) cameraMode = 'free';
-  history.replaceState(null, '', next ? `#${next.kind}=${encodeURIComponent(next.id)}` : location.pathname);
+  const hash = !next ? '' : next.kind === 'following' ? '#following' : `#${next.kind}=${encodeURIComponent(next.id)}`;
+  history.replaceState(null, '', hash || location.pathname);
   panelEl.hidden = !next;
+  renderFollowingButton();
   updatePadding();
   if (!next) return;
   renderPanel();
@@ -857,7 +968,7 @@ function select(next: Selection, keepTour = false) {
 }
 
 async function refreshPanelData() {
-  if (document.hidden || !selection) return;
+  if (document.hidden || !selection || selection.kind === 'following') return;
   const sel = selection;
   try {
     if (sel.kind === 'train') {
@@ -897,7 +1008,8 @@ const STATUS_TEXT: Record<Vehicle['status'], string> = {
 function renderPanel() {
   if (!selection) return;
   if (selection.kind === 'train') renderTrainPanel(selection.id);
-  else renderStationPanel(selection.id);
+  else if (selection.kind === 'station') renderStationPanel(selection.id);
+  else renderFollowingPanel();
   if (matchMedia('(max-width: 720px)').matches) updatePadding();
 }
 
@@ -924,14 +1036,21 @@ function renderTrainPanel(id: string) {
       .map((s) => `<li><span class="stop">${escape(s.name)}</span><time data-at="${s.at}">${countdown(s.at)}</time></li>`)
       .join('')}</ol>`;
 
+  const starred = isFollowed(id);
   panelEl.style.setProperty('--c', color);
   panelEl.innerHTML = `
+    ${backToFollowing ? '<button class="back" data-action="following">‹ Following</button>' : ''}
     <header>
       <div>
         <p class="eyebrow">${escape(t.route.name)}${branch}</p>
         <h2><span class="to">to</span> ${escape(destination)}</h2>
       </div>
-      <button class="icon-btn" data-action="close" aria-label="Close">✕</button>
+      <div class="header-actions">
+        <button class="star-btn" data-action="star" aria-pressed="${starred}" aria-label="${
+          starred ? 'Stop following this train' : 'Follow this train'
+        }" title="${starred ? 'Following: tap to stop' : 'Follow: saves it to your Following tab'}">${starred ? '★' : '☆'}</button>
+        <button class="icon-btn" data-action="close" aria-label="Close">✕</button>
+      </div>
     </header>
     <div class="facts">
       <div><span class="k">${STATUS_TEXT[v.status] ?? 'Now'}</span><span class="v">${escape(v.stopName ?? '—')}</span></div>
@@ -941,7 +1060,7 @@ function renderTrainPanel(id: string) {
     <div class="consist" aria-hidden="true">${carsHtml}</div>
     <div class="actions">
       <button class="primary" data-action="ride" aria-pressed="${cameraMode === 'ride'}">${cameraMode === 'ride' ? 'Riding along' : 'Ride along'}</button>
-      <button data-action="follow" aria-pressed="${cameraMode === 'follow'}">Follow</button>
+      <button data-action="follow" aria-pressed="${cameraMode === 'follow'}">Keep in view</button>
     </div>
     <h3>Next stops</h3>
     ${stopsHtml}
@@ -1001,7 +1120,89 @@ function renderStationPanel(id: string) {
   `;
 }
 
+function describeStatus(t: Train) {
+  const v = t.v;
+  const where = escape(v.stopName ?? 'its next stop');
+  if (v.status === 'STOPPED_AT') return `Stopped at ${where}`;
+  if (v.status === 'INCOMING_AT') return `Arriving at ${where}`;
+  return `Heading to ${where}`;
+}
+
+function renderFollowingPanel() {
+  panelEl.style.setProperty('--c', '#ffd166');
+  const rows = followed.map((f) => {
+    const t = trains.get(f.id);
+    const route = network?.routes.get(t?.v.routeId ?? f.routeId);
+    const c = route ? displayColor(route.color) : '#888';
+    const lineName = escape(route?.name ?? f.routeId);
+    if (!t) {
+      return `<li style="--c:${c}">
+        <button disabled>
+          <span class="bar"></span>
+          <span class="dest"><small>${lineName} · ${escape(f.label)}</small>Not running right now<span class="sub">It'll show up here when it's back in service</span></span>
+        </button>
+        <button class="unfollow" data-unfollow="${escape(f.id)}" aria-label="Stop following">✕</button>
+      </li>`;
+    }
+    const mph = t.speed != null && t.v.status !== 'STOPPED_AT' ? `${Math.round(t.speed * 2.237)} mph` : '';
+    const label = t.route.type === 2 && t.v.tripName ? `Train ${t.v.tripName}` : `Car ${t.v.label}`;
+    return `<li style="--c:${c}">
+      <button data-train="${escape(f.id)}">
+        <span class="bar"></span>
+        <span class="dest"><small>${lineName} · ${escape(label)}</small>to ${escape(
+          t.v.headsign ?? t.route.destinations[t.v.directionId] ?? '',
+        )}<span class="sub">${describeStatus(t)}</span></span>
+        <span class="times"><time>${mph || (t.v.status === 'STOPPED_AT' ? 'Stopped' : '')}</time><small data-ago="${t.v.updatedAt}">${ago(
+          t.v.updatedAt,
+        )}</small></span>
+      </button>
+      <button class="unfollow" data-unfollow="${escape(f.id)}" aria-label="Stop following">✕</button>
+    </li>`;
+  });
+
+  panelEl.innerHTML = `
+    <header>
+      <div>
+        <p class="eyebrow">Your trains</p>
+        <h2>Following</h2>
+      </div>
+      <button class="icon-btn" data-action="close" aria-label="Close">✕</button>
+    </header>
+    ${
+      rows.length
+        ? `<ul class="board following">${rows.join('')}</ul>`
+        : '<p class="muted empty">Tap the <strong>☆</strong> on any train and it’ll live here, with where it is right now. Followed trains glow gold on the map.</p>'
+    }
+    <p class="fine">Saved on this device</p>
+  `;
+}
+
+function toggleFollow(id: string) {
+  if (isFollowed(id)) followed = followed.filter((f) => f.id !== id);
+  else {
+    const t = trains.get(id);
+    if (!t) return;
+    const label = t.route.type === 2 && t.v.tripName ? `Train ${t.v.tripName}` : `Car ${t.v.label}`;
+    followed = [...followed, { id, routeId: t.v.routeId, label }];
+  }
+  save(FOLLOWING_KEY, followed);
+  renderFollowingButton();
+  renderPanel();
+}
+
+function renderFollowingButton() {
+  const badge = $('#following-btn .badge');
+  badge.textContent = String(followed.length);
+  badge.hidden = !followed.length;
+  $('#following-btn').setAttribute('aria-pressed', String(selection?.kind === 'following'));
+}
+
 panelEl.addEventListener('click', (e) => {
+  const unfollow = (e.target as HTMLElement).closest<HTMLElement>('[data-unfollow]');
+  if (unfollow) {
+    toggleFollow(unfollow.dataset.unfollow!);
+    return;
+  }
   const el = (e.target as HTMLElement).closest<HTMLElement>('[data-action],[data-train]');
   if (!el) return;
   if (el.dataset.train) {
@@ -1011,11 +1212,40 @@ panelEl.addEventListener('click', (e) => {
   }
   const action = el.dataset.action;
   if (action === 'close') select(null);
+  if (action === 'star' && selection?.kind === 'train') toggleFollow(selection.id);
+  if (action === 'following') select({ kind: 'following' });
   if (action === 'ride') setCameraMode(cameraMode === 'ride' ? 'free' : 'ride');
   if (action === 'follow') setCameraMode(cameraMode === 'follow' ? 'free' : 'follow');
 });
 
 $('#tour').addEventListener('click', () => setTouring(!touring));
+$('#following-btn').addEventListener('click', () =>
+  select(selection?.kind === 'following' ? null : { kind: 'following' }),
+);
+
+function applyViewMode(animate: boolean) {
+  document.querySelectorAll<HTMLButtonElement>('[data-view]').forEach((b) => {
+    b.setAttribute('aria-pressed', String(b.dataset.view === viewMode));
+  });
+  if (map.getLayer('buildings-3d')) map.setLayoutProperty('buildings-3d', 'visibility', flat() ? 'none' : 'visible');
+  if (flat()) {
+    // Lock the tilt only once the camera has flattened, or it snaps.
+    map.easeTo({ pitch: 0, bearing: cameraMode === 'ride' ? map.getBearing() : 0, duration: animate ? 900 : 0 });
+    map.once('moveend', () => flat() && map.setMaxPitch(0));
+  } else {
+    map.setMaxPitch(78);
+    map.easeTo({ pitch: cameraMode === 'ride' ? 72 : 52, duration: animate ? 900 : 0 });
+  }
+}
+
+document.querySelectorAll<HTMLButtonElement>('[data-view]').forEach((b) =>
+  b.addEventListener('click', () => {
+    if (b.dataset.view === viewMode) return;
+    viewMode = b.dataset.view as ViewMode;
+    save(VIEW_KEY, viewMode);
+    applyViewMode(true);
+  }),
+);
 $('#overview').addEventListener('click', () => {
   setTouring(false);
   select(null);
@@ -1025,7 +1255,7 @@ $('#overview').addEventListener('click', () => {
       [-71.13, 42.31],
       [-71.0, 42.4],
     ],
-    { pitch: 50, bearing: -18, duration: 2000, padding: 40 },
+    { pitch: flat() ? 0 : 50, bearing: flat() ? 0 : -18, duration: 2000, padding: 40 },
   );
 });
 
@@ -1042,20 +1272,35 @@ map.on('load', async () => {
   requestAnimationFrame(frame);
   // Credits start folded into the ⓘ button so they don't sit under the dock.
   document.querySelector('.maplibregl-ctrl-attrib')?.classList.remove('maplibregl-compact-show');
-  if (!location.hash) map.easeTo({ pitch: 52, bearing: -18, duration: 3000 });
+  if (flat()) applyViewMode(false);
+  else if (!location.hash) map.easeTo({ pitch: 52, bearing: -18, duration: 3000 });
+  document.querySelectorAll<HTMLButtonElement>('[data-view]').forEach((b) => {
+    b.setAttribute('aria-pressed', String(b.dataset.view === viewMode));
+  });
   renderDock();
+  renderFollowingButton();
 
-  try {
-    [network, stations] = await Promise.all([loadNetwork(), loadStations()]);
-  } catch (err) {
-    handleError(err, 'Couldn’t load the map of the T. Reload to try again.');
-    return;
+  // Keep trying: a rate limit or a blip at startup shouldn't need a reload.
+  for (let attempt = 0; !network; attempt++) {
+    try {
+      [network, stations] = await Promise.all([loadNetwork(), loadStations()]);
+    } catch (err) {
+      handleError(err, 'Couldn’t load the map of the T, retrying');
+      const wait = err instanceof RateLimited ? err.retryAt - Date.now() : 2000 * 2 ** Math.min(attempt, 4);
+      await new Promise((r) => setTimeout(r, Math.max(1000, wait)));
+    }
   }
   drawLines();
   drawStations();
   await poll();
   setInterval(poll, POLL_MS);
 
+  openFromHash();
+  // A link pasted into an open tab only changes the hash; follow it too.
+  window.addEventListener('hashchange', openFromHash);
+});
+
+function openFromHash() {
   const hash = new URLSearchParams(location.hash.slice(1));
   const trainId = hash.get('train');
   const stationId = hash.get('station');
@@ -1064,8 +1309,10 @@ map.on('load', async () => {
     setCameraMode('ride');
   } else if (stationId && stations.some((s) => s.id === stationId)) {
     select({ kind: 'station', id: stationId });
+  } else if (hash.has('following')) {
+    select({ kind: 'following' });
   }
-});
+}
 
 setInterval(tick, 1000);
 tick();

@@ -12,6 +12,9 @@ Boston in real time: every T and commuter rail train, drawn in 3D on a live map 
 - **Ride along** puts the camera behind a train and turns with the track;
   **Tour** hops between trains on its own
 - Tap a train for its next stops and speed, or a station for its live departure board
+- **☆ Follow** any train to keep it in your **Following** tab with its live
+  status; followed trains glow gold on the map (saved on your device)
+- **2D / 3D**: a flat north-up map, or the tilted city with buildings
 - Link straight to a train (`#train=<vehicle id>`) or a station (`#station=place-pktrm`)
 
 ## How accurate is it?
@@ -20,7 +23,13 @@ Every position report is snapped onto the exact route shape that train's trip
 runs on, and the train then glides *along the track* to its next report rather
 than cutting across. In testing, reports sat a median of 3.5 m from their
 track, 57 of 58 moving trains faced the same way as the MBTA's own bearing,
-and small backward jitters are held rather than shown. Positions are as fresh
+and small backward jitters are held rather than shown.
+
+About a quarter of moving trains go 12 seconds or more without a new report.
+Rather than freeze them, the app keeps them rolling at their measured speed
+(or the line's typical speed until it has one), never past the stop they're
+heading to and never while the MBTA says they're stopped. A new report then
+corrects them without sliding backwards. Positions are as fresh
 as the MBTA's own reports, usually under 30 seconds old; the panel shows each
 train's age.
 

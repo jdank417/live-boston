@@ -26,6 +26,16 @@
           <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 2.5v11l9-5.5z" fill="currentColor" /></svg>
           <span class="label">Tour</span>
         </button>
+        <button id="following-btn" aria-pressed="false" title="Trains you follow">
+          <svg viewBox="0 0 16 16" aria-hidden="true">
+            <path d="m8 1.5 1.9 4 4.4.5-3.3 3 .9 4.3L8 11.1l-3.9 2.2.9-4.3-3.3-3 4.4-.5z" fill="currentColor" />
+          </svg>
+          <span class="label">Following</span><span class="badge" hidden>0</span>
+        </button>
+        <div class="seg" role="group" aria-label="Map view">
+          <button data-view="2d" aria-pressed="false">2D</button>
+          <button data-view="3d" aria-pressed="true">3D</button>
+        </div>
         <button id="overview" title="Back to the whole map">
           <svg viewBox="0 0 16 16" aria-hidden="true">
             <path d="M8 2 2 7h1.5v6h3.5V9.5h2V13h3.5V7H14z" fill="currentColor" />

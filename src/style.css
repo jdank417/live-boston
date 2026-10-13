@@ -143,8 +143,10 @@ button {
 
 .controls {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
   margin-top: 14px;
+  max-width: 300px;
 }
 
 .controls button {
@@ -170,6 +172,44 @@ button {
 .controls svg {
   width: 13px;
   height: 13px;
+}
+
+#following-btn[aria-pressed='true'] {
+  border-color: #ffd166;
+  color: #ffd166;
+}
+
+.badge {
+  min-width: 18px;
+  padding: 1px 5px;
+  border-radius: 999px;
+  background: #ffd166;
+  color: #1a1405;
+  font-family: var(--mono);
+  font-size: 11px;
+  text-align: center;
+}
+
+.seg {
+  display: inline-flex;
+  padding: 2px;
+  border-radius: 999px;
+  border: 1px solid var(--edge-strong);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.controls .seg button {
+  padding: 6px 11px;
+  border: 0;
+  background: none;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.controls .seg button[aria-pressed='true'] {
+  background: var(--text);
+  color: var(--bg);
 }
 
 #tour[aria-pressed='true'] {
@@ -525,6 +565,90 @@ button {
   color: var(--dim);
 }
 
+/* Following and back links */
+
+.header-actions {
+  display: flex;
+  gap: 6px;
+  flex: none;
+}
+
+.star-btn {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  border: 1px solid var(--edge-strong);
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--muted);
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.star-btn:hover {
+  color: #ffd166;
+}
+
+.star-btn[aria-pressed='true'] {
+  border-color: #ffd166;
+  color: #ffd166;
+  background: rgba(255, 209, 102, 0.1);
+}
+
+.back {
+  margin: -6px 0 8px -4px;
+  padding: 2px 4px;
+  border: 0;
+  background: none;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.back:hover {
+  color: var(--text);
+}
+
+.board.following li {
+  display: flex;
+  gap: 6px;
+}
+
+.board.following li > button:first-child {
+  flex: 1;
+  min-width: 0;
+}
+
+.board .sub {
+  margin-top: 2px;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--muted);
+}
+
+/* Beats `.board button`, which would stretch it to a full row. */
+.board .unfollow {
+  flex: none;
+  justify-content: center;
+  padding: 0;
+  width: 34px;
+  border: 1px solid var(--edge);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--dim);
+  cursor: pointer;
+}
+
+.board .unfollow:hover {
+  color: var(--text);
+}
+
+.empty {
+  margin-top: 14px;
+  line-height: 1.5;
+}
+
 /* Station departure board */
 
 .board {
@@ -632,34 +756,41 @@ button {
     right: 12px;
     min-width: 0;
     padding: 12px 14px;
-    display: grid;
-    grid-template-columns: 1fr auto;
-    align-items: center;
-    column-gap: 10px;
   }
 
   #clock {
-    grid-row: 2;
-    font-size: 30px;
+    font-size: 28px;
   }
 
   #summary {
-    grid-column: 1 / -1;
-    margin-top: 6px;
+    margin-top: 4px;
     font-size: 12px;
   }
 
   .controls {
-    grid-column: 2;
-    grid-row: 1 / 3;
-    margin: 0;
-    flex-direction: column;
-    gap: 6px;
+    flex-wrap: nowrap;
+    max-width: none;
+    margin: 10px -14px -2px;
+    padding: 0 14px 2px;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+
+  .controls::-webkit-scrollbar {
+    display: none;
+  }
+
+  .controls > * {
+    flex: none;
   }
 
   .controls button {
     padding: 7px 11px;
     font-size: 12px;
+  }
+
+  #overview .label {
+    display: none;
   }
 
   #dock {

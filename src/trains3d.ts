@@ -19,12 +19,15 @@ export interface Car {
   front: boolean;
   rear: boolean;
   selected: boolean;
+  /** On your Following list: glows gold. */
+  followed: boolean;
 }
 
 const MAX_CARS = 3000;
 const WHITE = new THREE.Color('#ffffff');
 const HEADLIGHT = new THREE.Color('#fff4d6');
 const TAILLIGHT = new THREE.Color('#ff2a2a');
+const GOLD = new THREE.Color('#ffd166');
 
 // Every part is modelled in a unit car: x is length (-0.5 to 0.5, front at
 // +0.5), y is width, z is height from 0 (rail) to 1 (roof). Each instance is
@@ -233,6 +236,7 @@ export class TrainLayer implements CustomLayerInterface {
       this.windows.setColorAt(i, WHITE);
       this.bogies.setColorAt(i, WHITE);
       glowColor.copy(c.accent);
+      if (c.followed) glowColor.lerp(GOLD, 0.75).multiplyScalar(1.4);
       if (c.selected) glowColor.lerp(WHITE, 0.6).multiplyScalar(1.6);
       this.glow.setColorAt(i, glowColor);
 
