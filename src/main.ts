@@ -116,6 +116,25 @@ const TYPICAL_SPEED: Record<string, number> = {
   CR: 20,
 };
 
+/**
+ * The most a drawn train may reach (m/s), about each line's real top speed.
+ * Faster "measured" speeds are position jumps, not motion.
+ */
+const MAX_SPEED: Record<string, number> = {
+  Red: 25,
+  Orange: 25,
+  Blue: 22,
+  Green: 20,
+  Mattapan: 13,
+  SL: 22,
+  CR: 36,
+  Ferry: 15,
+  Amtrak: 67,
+};
+const maxSpeed = (group: string) => MAX_SPEED[group] ?? 25;
+/** Service braking (m/s²): drawn trains slow for a stop the way real ones do. */
+const BRAKE = 1.1;
+
 // ---------------------------------------------------------------------------
 // Saved per device. Storage can be unavailable (private mode), so every
 // access is guarded and the app works without it.
@@ -224,7 +243,7 @@ interface Train {
 
 const trains = new Map<string, Train>();
 const debugJumps: number[] = [];
-if (import.meta.env.DEV) Object.assign(window, { map, trains, speeds, debugJumps, toLngLat });
+if (import.meta.env.DEV) Object.assign(window, { map, trains, speeds, debugJumps, toLngLat, estimate });
 let lastUpdate = 0;
 let pausedUntil = 0;
 const colorCache = new Map<string, Color>();
@@ -730,13 +749,13 @@ function applyReport(v: Vehicle, now: number) {
     const moved = snapped.d - t.base;
     // Speed from the MBTA when it has one, otherwise from distance along the
     // track, smoothed so one short hop doesn't swing it.
-    if (v.speed != null) t.speed = v.speed;
-    else if (interval > 3000 && interval < 120_000) {
-      const measured = Math.max(0, moved) / (interval / 1000);
-      t.speed = t.speed == null ? measured : t.speed * 0.4 + measured * 0.6;
-    }
+    const measured = interval > 3000 && interval < 120_000 ? Math.max(0, moved) / (interval / 1000) : null;
+    // A "speed" past the line's top speed is the position jumping, not the train moving.
+    const believable = measured != null && measured <= maxSpeed(group) * 1.15;
+    if (v.speed != null) t.speed = Math.min(v.speed, maxSpeed(group));
+    else if (believable) t.speed = t.speed == null ? measured : t.speed * 0.4 + measured * 0.6;
     // Feed the speed map with runs between two moving reports.
-    if (track && wasMoving && v.status !== 'STOPPED_AT' && interval > 5000 && interval < 120_000 && moved > 0) {
+    if (track && believable && wasMoving && v.status !== 'STOPPED_AT' && interval > 5000 && moved > 0) {
       speeds.addRun(group, track, t.base, snapped.d, moved / (interval / 1000));
     }
     if (v.speed != null && v.status !== 'STOPPED_AT' && track) {
@@ -783,25 +802,36 @@ function estimate(t: Train, now: number): { d: number; vel: number } {
   let limit = t.base + 800;
   if (t.stopD != null && t.stopD > t.base) limit = Math.min(limit, t.stopD);
   else if (t.stopD != null) return { d: t.base, vel: 0 }; // At or past its stop already.
+  // Nor past the end of the line on a guess (only a report can put it there).
+  if (t.track) limit = Math.min(limit, Math.max(t.base, t.track.length));
+  if (limit <= t.base) return { d: t.base, vel: 0 };
   const run = (speed * Math.min(ms, 90_000)) / 1000;
   return run >= limit - t.base ? { d: limit, vel: 0 } : { d: t.base + run, vel: speed };
 }
 
 /**
- * Moves the drawn train toward its estimate like a train would: a critically
- * damped follow with capped acceleration and braking, matched to the
- * estimate's own speed so it doesn't lag behind a moving target.
+ * Moves the drawn train toward its estimate like a train would. It runs at
+ * the estimate's own speed, plus just enough to close any gap, and never
+ * faster than the line allows or faster than it could brake from in time,
+ * so it eases into a stop instead of sailing past it.
  */
 function step(t: Train, now: number, dt: number) {
   const target = estimate(t, now);
   const err = target.d - t.d;
-  if (err > 2500 || err < -800) {
+  // Too far behind to drive there believably (back from a hidden tab, or a
+  // big correction), or stuck well past a train that's standing still: put
+  // it where it is.
+  if (err > (target.vel > 0 ? 500 : 250) || err < -800 || (err < -150 && target.vel === 0)) {
     t.d = target.d;
     t.vel = target.vel;
     return;
   }
-  const w = 1.2;
-  const acc = Math.max(-3.5, Math.min(2.5, w * w * err + 2 * w * (target.vel - t.vel)));
+  const gap = Math.abs(err);
+  // Close the gap gently when it's small, and never faster than braking at
+  // BRAKE could undo by the time it arrives.
+  const closing = Math.min(0.5 * gap, Math.sqrt(2 * BRAKE * gap));
+  const want = Math.max(0, Math.min(maxSpeed(t.group), target.vel + Math.sign(err) * closing));
+  const acc = Math.max(-3, Math.min(1.5, (want - t.vel) / 0.5));
   t.vel = Math.max(0, t.vel + acc * dt);
   t.d += t.vel * dt;
 }
@@ -1984,5 +2014,18 @@ setInterval(tick, 1000);
 tick();
 
 document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) catchUp();
   if (!document.hidden && Date.now() - lastUpdate > POLL_MS) poll();
 });
+
+/** Puts every train straight at its estimate, after time the page didn't see. */
+function catchUp() {
+  const now = performance.now();
+  for (const t of trains.values()) {
+    if (t.track) {
+      const e = estimate(t, now);
+      t.d = e.d;
+      t.vel = e.vel;
+    } else t.start = now - t.dur;
+  }
+}
