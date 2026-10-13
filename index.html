@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="Boston in real time: every T train moving on a live 3D map of the city." />
+    <meta name="theme-color" content="#0d1117" />
+    <title>Live Boston</title>
+  </head>
+  <body>
+    <div id="map"></div>
+
+    <aside id="hud">
+      <h1>Live Boston</h1>
+      <p id="status" role="status">Connecting…</p>
+      <div id="legend" aria-label="Lines"></div>
+    </aside>
+
+    <section id="panel" hidden aria-live="polite"></section>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

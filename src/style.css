@@ -1,0 +1,277 @@
+:root {
+  --bg: #0d1117;
+  --card: rgba(13, 17, 23, 0.82);
+  --border: rgba(240, 246, 252, 0.12);
+  --text: #e6edf3;
+  --muted: #8b949e;
+  --warn: #f0b72f;
+  color-scheme: dark;
+  font-family:
+    ui-sans-serif,
+    system-ui,
+    -apple-system,
+    'Segoe UI',
+    sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  overflow: hidden;
+}
+
+#map {
+  position: absolute;
+  inset: 0;
+}
+
+#hud,
+#panel {
+  position: absolute;
+  background: var(--card);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
+}
+
+/* Top-left: title, status and line toggles ------------------------------- */
+
+#hud {
+  top: 16px;
+  left: 16px;
+  padding: 14px 14px 10px;
+  width: 230px;
+}
+
+h1 {
+  margin: 0;
+  font-size: 18px;
+  letter-spacing: -0.01em;
+}
+
+#status {
+  margin: 2px 0 10px;
+  font-size: 12px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+#status.warn {
+  color: var(--warn);
+}
+
+#legend {
+  display: grid;
+  gap: 2px;
+}
+
+.line {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 8px;
+  background: none;
+  color: inherit;
+  font: inherit;
+  font-size: 14px;
+  cursor: pointer;
+  text-align: left;
+}
+
+.line:hover {
+  background: rgba(240, 246, 252, 0.06);
+}
+
+.line.off {
+  opacity: 0.4;
+}
+
+.swatch {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+}
+
+.line .name {
+  flex: 1;
+}
+
+.count {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Right: the selected train ------------------------------------------------ */
+
+#panel {
+  top: 16px;
+  right: 16px;
+  width: 300px;
+  max-height: calc(100% - 32px);
+  overflow: auto;
+  padding: 16px;
+  border-top: 4px solid var(--line);
+}
+
+#panel header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.eyebrow {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--line);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  filter: brightness(1.4);
+}
+
+#panel h2 {
+  margin: 2px 0 0;
+  font-size: 22px;
+  letter-spacing: -0.01em;
+}
+
+.close {
+  border: 0;
+  background: none;
+  color: var(--muted);
+  font-size: 24px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 4px;
+}
+
+.now {
+  margin: 12px 0 2px;
+}
+
+.muted {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+#panel h3 {
+  margin: 16px 0 6px;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+
+.stops {
+  list-style: none;
+  margin: 0;
+  padding: 0 0 0 14px;
+  border-left: 2px solid var(--line);
+}
+
+.stops li {
+  position: relative;
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 5px 0;
+  font-size: 14px;
+}
+
+.stops li::before {
+  content: '';
+  position: absolute;
+  left: -20px;
+  top: 50%;
+  width: 8px;
+  height: 8px;
+  margin-top: -4px;
+  border-radius: 50%;
+  background: var(--bg);
+  border: 2px solid var(--line);
+}
+
+.stops time {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.follow {
+  margin-top: 16px;
+  width: 100%;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: rgba(240, 246, 252, 0.06);
+  color: inherit;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.follow[aria-pressed='true'] {
+  background: var(--line);
+  border-color: var(--line);
+}
+
+/* Phones: HUD shrinks, the panel becomes a bottom sheet -------------------- */
+
+@media (max-width: 640px) {
+  #hud {
+    top: 12px;
+    left: 12px;
+    right: 12px;
+    width: auto;
+    padding: 10px 12px 8px;
+  }
+
+  #legend {
+    grid-template-columns: repeat(5, auto);
+    justify-content: space-between;
+    gap: 0;
+  }
+
+  .line {
+    gap: 4px;
+    padding: 4px 3px;
+    font-size: 12px;
+  }
+
+  .swatch {
+    width: 9px;
+    height: 9px;
+  }
+
+  .line .count {
+    font-size: 11px;
+  }
+
+  /* Pinch and two-finger drag replace the zoom buttons on a phone. */
+  .maplibregl-ctrl-bottom-right .maplibregl-ctrl-group {
+    display: none;
+  }
+
+  #panel {
+    top: auto;
+    bottom: 36px;
+    left: 12px;
+    right: 12px;
+    width: auto;
+    max-height: 55%;
+  }
+}
