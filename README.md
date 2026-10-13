@@ -14,6 +14,9 @@ Boston in real time: every T, commuter rail and Silver Line vehicle in 3D, Blueb
   starred; and **Map**, for 2D/3D, layers and today's sunrise and sunset
 - **Ride along** steps the interface aside and follows a train with a minimal
   caption bar; **Take the tour** hops between trains on its own
+- **Spin the city** with two fingers: twist on a touchscreen, or swipe
+  sideways on a trackpad (any browser; a real twist works in Safari too).
+  While riding along, spinning looks around, then eases back behind the train
 - Tap a train for its next stops and speed, a station for its departures, or a
   Bluebikes dock for bikes and open docks
 - **Speed map**: track colored by how fast trains actually move over it, so

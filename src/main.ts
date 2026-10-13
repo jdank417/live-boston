@@ -241,6 +241,9 @@ let selection: Selection = null;
 type CameraMode = 'free' | 'follow' | 'ride';
 let cameraMode: CameraMode = 'free';
 let rideBearing = 0;
+/** Degrees the rider has turned to look around while riding along. */
+let rideLook = 0;
+let lookedAt = 0;
 let touring = false;
 let tourNext = 0;
 let lastInteraction = performance.now();
@@ -939,7 +942,7 @@ function frame() {
   // The dots only show when zoomed out; skip rebuilding them otherwise.
   if (zoom < 16.1 || frameCount % 30 === 0) drawDots(selectedId);
   drawArrivals(now);
-  driveCamera(now, dt);
+  driveCamera(now);
   precipitation.frame(dt, map.getBearing(), now);
   map.triggerRepaint();
   frameCount++;
@@ -980,13 +983,29 @@ function drawArrivals(now: number) {
   });
 }
 
-function driveCamera(now: number, dt: number) {
+let lastCamera = performance.now();
+
+function driveCamera(now: number) {
+  // The camera eases by real time, so it settles at the same pace on a slow
+  // device as on a fast one.
+  const dt = Math.min(0.5, (now - lastCamera) / 1000);
+  lastCamera = now;
   if (touring && now > tourNext) nextTourStop();
+  // Never steer while someone has their hands on the map: moving the camera
+  // resets MapLibre's gesture handlers, so a pinch or twist could never start.
+  const busy = handsOn(now);
+  if (wasBusy && !busy && cameraMode === 'ride') {
+    // They turned to look around; keep that view for a moment.
+    rideLook = (((map.getBearing() - rideBearing + 540) % 360) - 180);
+    lookedAt = now;
+  }
+  wasBusy = busy;
+  if (busy || map.isEasing()) return;
   // Left alone, the overview slowly circles the city.
-  if (cameraMode === 'free' && !flat() && now - lastInteraction > IDLE_ORBIT_MS && !map.isEasing()) {
+  if (cameraMode === 'free' && !flat() && now - lastInteraction > IDLE_ORBIT_MS) {
     map.setBearing(map.getBearing() + 1.4 * dt);
   }
-  if (cameraMode === 'free' || selection?.kind !== 'train' || map.isEasing()) return;
+  if (cameraMode === 'free' || selection?.kind !== 'train') return;
   const t = trains.get(selection.id);
   if (!t) return;
   if (cameraMode === 'follow') {
@@ -997,13 +1016,125 @@ function driveCamera(now: number, dt: number) {
   const target = compass(t.heading);
   const delta = ((target - rideBearing + 540) % 360) - 180;
   rideBearing = (rideBearing + delta * (1 - Math.exp(-dt / 0.9)) + 360) % 360;
+  // A few seconds after looking around, swing back to behind the train.
+  if (now - lookedAt > 4000) rideLook *= Math.exp(-dt / 1.2);
   // Aim past the train so it sits in the lower part of the view.
   const ahead = 45;
   map.jumpTo({
     center: toLngLat(t.x + Math.cos(t.heading) * ahead, t.y + Math.sin(t.heading) * ahead),
-    bearing: rideBearing,
+    bearing: rideBearing + rideLook,
   });
 }
+
+// ---------------------------------------------------------------------------
+// Spinning and other hands-on moves.
+//
+// MapLibre turns a two-finger twist on a touchscreen into a spin, and a
+// right-drag or Ctrl-drag with a mouse. Trackpads are the gap: Chrome, Edge and
+// Firefox never tell a web page about a trackpad twist, and Safari does (as
+// gesture events) but MapLibre doesn't listen. So here a sideways two-finger
+// swipe spins the map in every browser, and in Safari a real twist does too.
+// Up and down still zooms, as before.
+
+const mapEl = document.getElementById('map')!;
+const pointers = new Set<number>();
+let lastWheel = 0;
+let wasBusy = false;
+
+if (import.meta.env.DEV)
+  Object.assign(window, {
+    cameraDebug: () => ({
+      pointers: pointers.size,
+      sinceWheel: Math.round(performance.now() - lastWheel),
+      moving: map.isMoving(),
+      easing: map.isEasing(),
+      rideLook: Math.round(rideLook),
+      sinceLook: Math.round(performance.now() - lookedAt),
+      cameraMode,
+    }),
+  });
+
+function handsOn(now: number) {
+  return pointers.size > 0 || now - lastWheel < 350 || map.isMoving();
+}
+
+mapEl.addEventListener('pointerdown', (e) => pointers.add(e.pointerId), { capture: true });
+for (const type of ['pointerup', 'pointercancel', 'pointerleave'] as const) {
+  addEventListener(type, (e) => pointers.delete((e as PointerEvent).pointerId), { capture: true });
+}
+
+/** Turns the view by `degrees`, or looks around if riding along. */
+function spin(degrees: number) {
+  const now = performance.now();
+  lastInteraction = now;
+  if (cameraMode === 'ride') {
+    rideLook = (((rideLook + degrees + 540) % 360) - 180);
+    lookedAt = now;
+    map.setBearing(rideBearing + rideLook);
+  } else {
+    map.setBearing(map.getBearing() + degrees);
+  }
+}
+
+// Each swipe is either a spin or a zoom, decided at its start, so a slightly
+// diagonal swipe doesn't flicker between the two.
+let wheelAxis: 'spin' | 'zoom' = 'zoom';
+let lastPinchWheel = 0;
+mapEl.addEventListener(
+  'wheel',
+  (e) => {
+    const now = performance.now();
+    if (e.ctrlKey) {
+      // A trackpad pinch arrives as Ctrl+wheel; that's MapLibre's zoom.
+      lastPinchWheel = now;
+      lastWheel = now;
+      return;
+    }
+    if (now - lastWheel > 250) wheelAxis = Math.abs(e.deltaX) > Math.abs(e.deltaY) ? 'spin' : 'zoom';
+    lastWheel = now;
+    if (wheelAxis !== 'spin') return;
+    e.preventDefault();
+    e.stopPropagation();
+    const px = e.deltaMode === 1 ? e.deltaX * 16 : e.deltaX;
+    // Swiping left pulls the near side of the city left, like grabbing it.
+    spin(-px * 0.25);
+  },
+  { capture: true, passive: false },
+);
+
+// Safari's trackpad twist and pinch. On iPhone and iPad these come alongside
+// touch events MapLibre already handles, so they're ignored while touching.
+interface SafariGesture extends UIEvent {
+  rotation: number;
+  scale: number;
+}
+let gestureFrom: { bearing: number; zoom: number; look: number } | null = null;
+mapEl.addEventListener('gesturestart', (e) => {
+  e.preventDefault();
+  if (pointers.size) return;
+  gestureFrom = { bearing: map.getBearing(), zoom: map.getZoom(), look: rideLook };
+});
+mapEl.addEventListener('gesturechange', (e) => {
+  e.preventDefault();
+  if (!gestureFrom || pointers.size) return;
+  const g = e as SafariGesture;
+  const now = performance.now();
+  lastWheel = now;
+  lastInteraction = now;
+  if (cameraMode === 'ride') {
+    rideLook = gestureFrom.look - g.rotation;
+    lookedAt = now;
+    map.setBearing(rideBearing + rideLook);
+  } else {
+    map.setBearing(gestureFrom.bearing - g.rotation);
+  }
+  // Zoom too, unless Safari is also sending the pinch as Ctrl+wheel.
+  if (now - lastPinchWheel > 300) map.setZoom(gestureFrom.zoom + Math.log2(g.scale));
+});
+mapEl.addEventListener('gestureend', (e) => {
+  e.preventDefault();
+  gestureFrom = null;
+});
 
 function setCameraMode(mode: CameraMode) {
   cameraMode = mode;
@@ -1012,6 +1143,7 @@ function setCameraMode(mode: CameraMode) {
   updatePadding(true);
   if (t && mode === 'ride') {
     rideBearing = compass(t.heading);
+    rideLook = 0;
     map.easeTo({
       center: toLngLat(t.x, t.y),
       zoom: t.route.type === 2 ? 17.4 : 18,
@@ -1102,9 +1234,10 @@ map.on('mousemove', (e) => {
   });
 });
 
-// Dragging hands the camera back.
+// Dragging with one finger or the mouse hands the camera back. Two fingers
+// are a pinch or a twist, which work while following or riding along.
 map.on('dragstart', () => {
-  if (cameraMode !== 'free') setCameraMode('free');
+  if (cameraMode !== 'free' && pointers.size < 2) setCameraMode('free');
 });
 for (const type of ['pointerdown', 'wheel', 'keydown'] as const) {
   addEventListener(type, () => (lastInteraction = performance.now()), { passive: true });
@@ -1367,6 +1500,25 @@ function renderMapTab() {
       ${setting('weather', ICON.rain, 'Weather', 'Live rain and snow over the city')}
     </section>
     <section class="group" style="--i:2">
+      <h3>Moving around</h3>
+      <ul class="moves">
+        ${(touchFirst
+          ? [
+              ['Spin', 'Twist with two fingers'],
+              ['Tilt', 'Drag two fingers up or down'],
+              ['Zoom', 'Pinch'],
+            ]
+          : [
+              ['Spin', 'Swipe sideways with two fingers, or right-drag'],
+              ['Tilt', 'Ctrl-drag, or right-drag up and down'],
+              ['Zoom', 'Pinch, or scroll'],
+            ]
+        )
+          .map(([k, v]) => `<li><b>${k}</b><span>${v}</span></li>`)
+          .join('')}
+      </ul>
+    </section>
+    <section class="group" style="--i:3">
       <h3>Sky over Boston</h3>
       <div class="sky">
         <div><small>Now</small><strong>${sunPhase()}</strong></div>
@@ -1374,7 +1526,7 @@ function renderMapTab() {
         <div><small>Sunset</small><strong>${set ? clockFmt.format(set) : '—'}</strong></div>
       </div>
     </section>
-    <p class="credits" style="--i:3">Live data from the MBTA, Bluebikes and Open-Meteo. Map data © OpenStreetMap contributors, OpenMapTiles.</p>`;
+    <p class="credits" style="--i:4">Live data from the MBTA, Bluebikes and Open-Meteo. Map data © OpenStreetMap contributors, OpenMapTiles.</p>`;
 }
 
 function renderFollowingBadge() {
@@ -1716,7 +1868,11 @@ function applyViewMode(animate: boolean) {
 // Map controls
 $('#zoom-in').addEventListener('click', () => map.zoomIn());
 $('#zoom-out').addEventListener('click', () => map.zoomOut());
-$('#compass').addEventListener('click', () => map.easeTo({ bearing: 0, pitch: flat() ? 0 : map.getPitch(), duration: 700 }));
+$('#compass').addEventListener('click', () => {
+  // Riding along, "north" means back to looking ahead of the train.
+  if (cameraMode === 'ride') rideLook = 0;
+  else map.easeTo({ bearing: 0, pitch: flat() ? 0 : map.getPitch(), duration: 700 });
+});
 $('#overview').addEventListener('click', () => {
   select(null);
   if (cameraMode !== 'free') setCameraMode('free');
@@ -1783,9 +1939,31 @@ map.on('load', async () => {
   setInterval(poll, POLL_MS);
 
   openFromHash();
+  if (!deepLink) setTimeout(showSpinTip, 6500);
   // A link pasted into an open tab only changes the hash; follow it too.
   window.addEventListener('hashchange', openFromHash);
 });
+
+/** Phones and tablets: a touchscreen is the main way in. */
+const touchFirst = matchMedia('(pointer: coarse)').matches;
+
+/** A one-time hint on how to spin the city, shown after the intro. */
+function showSpinTip() {
+  const KEY = 'live-boston:tip-spin';
+  if (load(KEY, false)) return;
+  save(KEY, true);
+  const tip = $('#tip');
+  tip.querySelector('span')!.textContent = touchFirst
+    ? 'Twist with two fingers to spin the city'
+    : 'Swipe sideways with two fingers to spin the city';
+  tip.hidden = false;
+  const hide = () => tip.classList.add('out');
+  tip.addEventListener('click', hide);
+  setTimeout(hide, 7000);
+  tip.addEventListener('animationend', (e) => {
+    if ((e as AnimationEvent).animationName === 'tip-out') tip.hidden = true;
+  });
+}
 
 function openFromHash() {
   const hash = new URLSearchParams(location.hash.slice(1));
