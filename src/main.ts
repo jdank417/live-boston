@@ -4,14 +4,18 @@ import 'maplibre-gl/dist/maplibre-gl.css';
 import './style.css';
 import { basemap, PALETTE } from './basemap';
 import { loadDocks, type Dock } from './bikes';
+import { causeLabel, effectLabel, EXTERNAL, isDisruptive, kindOf as alertKind } from './alerts';
+import { loadAmtrak, type AmtrakTrain } from './amtrak';
 import { compass, toLngLat, toLocal, Track } from './geo';
 import {
+  loadAlerts,
   loadDepartures,
   loadNetwork,
   loadStations,
   loadUpcomingStops,
   loadVehicles,
   RateLimited,
+  type Alert,
   type Departure,
   type Network,
   type Route,
@@ -19,6 +23,8 @@ import {
   type UpcomingStop,
   type Vehicle,
 } from './mbta';
+import { install, installMode, onInstallChange, registerServiceWorker } from './pwa';
+import { search, type SearchItem } from './search';
 import { isPhone, Sheet } from './sheet';
 import { blend, SKY, skyAt, sunTimes, type SkyState } from './sky';
 import { SPEED_SCALE, SpeedMap } from './speedmap';
@@ -26,6 +32,9 @@ import { TrainLayer, type Car } from './trains3d';
 import { CLEAR, loadWeather, Precipitation, weatherOverride, type Weather } from './weather';
 
 const POLL_MS = 12_000;
+const AMTRAK_MS = 60_000;
+const ALERTS_MS = 90_000;
+const COMMUTE_MS = 30_000;
 const PANEL_REFRESH_MS = 20_000;
 const TOUR_MS = 25_000;
 const BIKES_MS = 60_000;
@@ -46,19 +55,32 @@ interface Group {
   id: string;
   label: string;
   match: (r: Route) => boolean;
+  /** What its vehicles are called in counts. */
+  unit: string;
+  /** For groups whose routes only appear once their vehicles do. */
+  color?: string;
 }
 
+/** Amtrak's stand-in route type; the MBTA's run 0–4. */
+const AMTRAK_TYPE = 99;
+const AMTRAK_COLOR = '#8b9cff';
+
 const GROUPS: Group[] = [
-  { id: 'Red', label: 'Red Line', match: (r) => r.id === 'Red' },
-  { id: 'Orange', label: 'Orange Line', match: (r) => r.id === 'Orange' },
-  { id: 'Blue', label: 'Blue Line', match: (r) => r.id === 'Blue' },
-  { id: 'Green', label: 'Green Line', match: (r) => r.id.startsWith('Green-') },
-  { id: 'Mattapan', label: 'Mattapan Trolley', match: (r) => r.id === 'Mattapan' },
-  { id: 'SL', label: 'Silver Line', match: (r) => r.type === 3 },
-  { id: 'CR', label: 'Commuter Rail', match: (r) => r.type === 2 },
+  { id: 'Red', label: 'Red Line', unit: 'trains', match: (r) => r.id === 'Red' },
+  { id: 'Orange', label: 'Orange Line', unit: 'trains', match: (r) => r.id === 'Orange' },
+  { id: 'Blue', label: 'Blue Line', unit: 'trains', match: (r) => r.id === 'Blue' },
+  { id: 'Green', label: 'Green Line', unit: 'trains', match: (r) => r.id.startsWith('Green-') },
+  { id: 'Mattapan', label: 'Mattapan Trolley', unit: 'trolleys', match: (r) => r.id === 'Mattapan' },
+  { id: 'SL', label: 'Silver Line', unit: 'buses', match: (r) => r.type === 3 },
+  { id: 'CR', label: 'Commuter Rail', unit: 'trains', match: (r) => r.type === 2 },
+  { id: 'Ferry', label: 'Ferries', unit: 'boats', match: (r) => r.type === 4 },
+  // Not the MBTA, but on its tracks: the Providence and Worcester lines, and
+  // North and South Station.
+  { id: 'Amtrak', label: 'Amtrak', unit: 'trains', color: AMTRAK_COLOR, match: (r) => r.type === AMTRAK_TYPE },
 ];
 const groupOf = (r: Route) => GROUPS.find((g) => g.match(r))?.id ?? r.id;
-const kindOf = (r: Route) => (r.type === 2 ? 'rail' : r.type === 3 ? 'bus' : 'subway');
+const kindOf = (r: Route) => (r.type === 2 ? 'rail' : r.type === 3 ? 'bus' : r.type === 4 ? 'ferry' : 'subway');
+const isAmtrak = (id: string) => id.startsWith('amtrak-');
 
 /** Brand colors, with the darkest brightened so they hold up on a dark map. */
 const ON_DARK: Record<string, string> = {
@@ -66,6 +88,7 @@ const ON_DARK: Record<string, string> = {
   '#80276C': '#c050ad', // Commuter Rail
   '#7C878E': '#b4bec6', // Silver Line
   '#00843D': '#16a34a', // Green Line
+  '#008EAA': '#22b8cf', // Ferries
 };
 function displayColor(hex: string) {
   return ON_DARK[hex.toUpperCase()] ?? hex;
@@ -76,6 +99,7 @@ interface CarSpec {
   width: number;
   height: number;
   body: string;
+  boat?: boolean;
 }
 
 // Real car dimensions in meters (length over couplers, width, height to roof).
@@ -93,8 +117,23 @@ const BILEVEL: CarSpec = { length: 25.9, width: 3.2, height: 4.9, body: '#ccd1d9
 const BUS_FRONT: CarSpec = { length: 11, width: 2.6, height: 3.3, body: '#d3d8de' };
 const BUS_REAR: CarSpec = { length: 7, width: 2.6, height: 3.3, body: '#d3d8de' };
 
+// MBTA harbor ferries are 25–35 m catamarans.
+const FERRY: CarSpec = { length: 30, width: 9.5, height: 6.5, body: '#e7ebef', boat: true };
+// Amtrak: Acela trainsets, and a locomotive with Amfleet coaches for the rest.
+const ACELA_POWER: CarSpec = { length: 21, width: 3.2, height: 4.3, body: '#eef1f4' };
+const ACELA_COACH: CarSpec = { length: 26.5, width: 3.2, height: 4.1, body: '#f3f5f7' };
+const AMTRAK_LOCO: CarSpec = { length: 20.5, width: 3.1, height: 4.4, body: '#aeb6c1' };
+const AMFLEET: CarSpec = { length: 25.9, width: 3.2, height: 3.9, body: '#d3d8de' };
+
 /** The consist to draw, and whether its size is a typical one rather than reported. */
 function consist(route: Route, reported: number | null): { cars: CarSpec[]; estimated: boolean; gap: number } {
+  if (route.type === 4) return { cars: [FERRY], estimated: false, gap: 0 };
+  if (route.type === AMTRAK_TYPE) {
+    // Amtrak doesn't report consists either; these are the usual sets.
+    if (route.short === 'Acela') return { cars: [ACELA_POWER, ...Array(6).fill(ACELA_COACH), ACELA_POWER], estimated: true, gap: 0.8 };
+    const coaches = route.short === 'Downeaster' ? 5 : 7;
+    return { cars: [AMTRAK_LOCO, ...Array(coaches).fill(AMFLEET)], estimated: true, gap: 1 };
+  }
   if (route.type === 3) return { cars: [BUS_FRONT, BUS_REAR], estimated: false, gap: 0.35 };
   if (route.type === 2) {
     // Commuter rail doesn't report its consist; draw a typical push-pull set.
@@ -114,6 +153,8 @@ const TYPICAL_SPEED: Record<string, number> = {
   Mattapan: 6,
   SL: 6,
   CR: 20,
+  Ferry: 9,
+  Amtrak: 30,
 };
 
 /**
@@ -161,7 +202,12 @@ let viewMode: ViewMode = load<ViewMode>(VIEW_KEY, '3d') === '2d' ? '2d' : '3d';
 const flat = () => viewMode === '2d';
 
 const LAYERS_KEY = 'live-boston:layers';
-const layers = { speed: false, bikes: false, weather: true, ...load(LAYERS_KEY, {}) };
+const layers = { speed: false, bikes: false, weather: true, alerts: true, ...load(LAYERS_KEY, {}) };
+
+const LINE_KINDS = ['ferry', 'bus', 'rail', 'subway'] as const;
+const LINE_OPACITY = { ferry: 0.75, bus: 0.85, rail: 0.85, subway: 1 };
+/** Disruptions: suspended stretches, closed stations, bunched trains. */
+const AMBER = '#fbbf24';
 
 /** A train you follow, with enough to describe it while it's out of service. */
 interface Followed {
@@ -199,9 +245,16 @@ const speeds = new SpeedMap();
 // State
 
 let network: Network | null = null;
+/** The MBTA's own routes, before Amtrak's stand-ins join the network. */
+let mbtaRouteIds: string[] = [];
 const tracks = new Map<string, Track>();
 let stations: Station[] = [];
+/** A station by its own id or any of its platforms'. */
+const stationByStop = new Map<string, Station>();
 const hidden = new Set<string>();
+/** The latest from Amtrak for each of its trains on the map: stops and lateness. */
+const amtrakInfo = new Map<string, AmtrakTrain>();
+let alerts: Alert[] = [];
 
 interface Train {
   v: Vehicle;
@@ -243,7 +296,7 @@ interface Train {
 
 const trains = new Map<string, Train>();
 const debugJumps: number[] = [];
-if (import.meta.env.DEV) Object.assign(window, { map, trains, speeds, debugJumps, toLngLat, estimate });
+if (import.meta.env.DEV) Object.assign(window, { map, trains, speeds, debugJumps, toLngLat });
 let lastUpdate = 0;
 let pausedUntil = 0;
 const colorCache = new Map<string, Color>();
@@ -253,11 +306,13 @@ const color = (hex: string) => {
   return c;
 };
 
-type Tab = 'lines' | 'following' | 'map';
+type Tab = 'lines' | 'alerts' | 'following' | 'map';
 let tab: Tab = 'lines';
 type Selection = { kind: 'train' | 'station' | 'dock'; id: string } | null;
 let selection: Selection = null;
-type CameraMode = 'free' | 'follow' | 'ride';
+/** Ride along behind the train, or from the driver's seat. */
+type CameraMode = 'free' | 'follow' | 'ride' | 'cab';
+const riding = () => cameraMode === 'ride' || cameraMode === 'cab';
 let cameraMode: CameraMode = 'free';
 let rideBearing = 0;
 /** Degrees the rider has turned to look around while riding along. */
@@ -350,21 +405,24 @@ function addLayers() {
   );
 
   // Lines: a dark casing under each so crossings stay crisp, then the line.
+  // Past zoom 17 they widen to about a real track bed, for the cab view.
   map.addSource('lines', { type: 'geojson', data: empty() });
-  const widths = { subway: [1.6, 6], rail: [1, 3.6], bus: [0.8, 3] } as const;
-  for (const kind of ['bus', 'rail', 'subway'] as const) {
+  const widths = { ferry: [0.8, 2.4], subway: [1.6, 6], rail: [1, 3.6], bus: [0.8, 3] } as const;
+  const width = (lo: number, hi: number, pad = 0) =>
+    ['interpolate', ['exponential', 1.5], ['zoom'], 9, lo + pad / 2, 17, hi + pad, 18, hi * 1.4 + pad, 20, hi * 5 + pad, 22, hi * 22 + pad] as any;
+  for (const kind of LINE_KINDS) {
     const [lo, hi] = widths[kind];
-    map.addLayer({
-      id: `${kind}-casing`,
-      type: 'line',
-      source: 'lines',
-      filter: ['==', ['get', 'kind'], kind],
-      layout: { 'line-cap': 'round', 'line-join': 'round' },
-      paint: {
-        'line-color': PALETTE.background,
-        'line-width': ['interpolate', ['exponential', 1.5], ['zoom'], 9, lo + 2, 17, hi + 4],
-      },
-    });
+    // Ferries cross open water, where a casing would only darken it.
+    if (kind !== 'ferry') {
+      map.addLayer({
+        id: `${kind}-casing`,
+        type: 'line',
+        source: 'lines',
+        filter: ['==', ['get', 'kind'], kind],
+        layout: { 'line-cap': 'round', 'line-join': 'round' },
+        paint: { 'line-color': PALETTE.background, 'line-width': width(lo, hi, 4) },
+      });
+    }
     map.addLayer({
       id: `${kind}-lines`,
       type: 'line',
@@ -373,13 +431,28 @@ function addLayers() {
       layout: { 'line-cap': 'round', 'line-join': 'round' },
       paint: {
         'line-color': ['get', 'color'],
-        'line-width': ['interpolate', ['exponential', 1.5], ['zoom'], 9, lo, 17, hi],
-        'line-opacity': kind === 'subway' ? 1 : 0.85,
-        // The Silver Line runs on streets: dashed, like a bus route.
-        ...(kind === 'bus' ? { 'line-dasharray': [1.6, 1.2] } : {}),
+        'line-width': width(lo, hi),
+        'line-opacity': LINE_OPACITY[kind],
+        // The Silver Line runs on streets and ferries on water: dashed.
+        ...(kind === 'bus' ? { 'line-dasharray': [1.6, 1.2] } : kind === 'ferry' ? { 'line-dasharray': [2, 2.4] } : {}),
       },
     });
   }
+
+  // Where service is suspended or replaced by shuttles: an amber stripe over the line.
+  map.addSource('alert-lines', { type: 'geojson', data: empty() });
+  map.addLayer({
+    id: 'alert-lines',
+    type: 'line',
+    source: 'alert-lines',
+    layout: { 'line-cap': 'round', 'line-join': 'round' },
+    paint: {
+      'line-color': AMBER,
+      'line-width': width(2.2, 7),
+      'line-opacity': 0.9,
+      'line-dasharray': [0.6, 1.4],
+    },
+  });
 
   // The speed map paints over the lines when it's on.
   map.addSource('speed', { type: 'geojson', data: empty() });
@@ -452,12 +525,31 @@ function addLayers() {
         ['case', ['get', 'major'], 7, 5],
       ],
       'circle-color': PALETTE.background,
-      'circle-stroke-color': ['case', ['get', 'rail'], '#e3a6d8', ['get', 'bus'], '#b4bec6', '#ffffff'],
+      'circle-stroke-color': ['case', ['get', 'ferry'], '#22b8cf', ['get', 'rail'], '#e3a6d8', ['get', 'bus'], '#b4bec6', '#ffffff'],
       'circle-stroke-width': ['interpolate', ['linear'], ['zoom'], 10, 1, 17, 2.5],
       'circle-opacity': show(14.5) as any,
       'circle-stroke-opacity': show(14.5) as any,
     },
   });
+
+  // Stations with a closure or on a suspended stretch: an amber halo.
+  map.addSource('alert-stations', { type: 'geojson', data: empty() });
+  map.addLayer(
+    {
+      id: 'alert-stations',
+      type: 'circle',
+      source: 'alert-stations',
+      minzoom: 10,
+      paint: {
+        'circle-radius': ['interpolate', ['linear'], ['zoom'], 10, 4, 14, 8, 17, 13],
+        'circle-color': 'rgba(251, 191, 36, 0.14)',
+        'circle-stroke-color': AMBER,
+        'circle-stroke-width': ['interpolate', ['linear'], ['zoom'], 10, 1, 17, 2],
+        'circle-stroke-opacity': 0.9,
+      },
+    },
+    'stations',
+  );
 
   // A ring that ripples out from a station as a train pulls in.
   map.addSource('arrivals', { type: 'geojson', data: empty() });
@@ -484,11 +576,11 @@ function addLayers() {
     id: 'vehicle-rings',
     type: 'circle',
     source: 'vehicles',
-    filter: ['any', ['get', 'selected'], ['get', 'followed']],
+    filter: ['any', ['get', 'selected'], ['get', 'followed'], ['get', 'bunched']],
     paint: {
       'circle-radius': ['interpolate', ['linear'], ['zoom'], 9, 6, 15, 12],
       'circle-color': 'rgba(0,0,0,0)',
-      'circle-stroke-color': ['case', ['get', 'selected'], '#ffffff', '#ffc94d'],
+      'circle-stroke-color': ['case', ['get', 'selected'], '#ffffff', ['get', 'followed'], '#ffc94d', AMBER],
       'circle-stroke-width': 2,
       'circle-stroke-opacity': fadeOut(1) as any,
     },
@@ -582,7 +674,7 @@ function drawStations() {
     type: 'FeatureCollection',
     features: stations.map((s) => ({
       type: 'Feature',
-      properties: { id: s.id, name: s.name, rail: s.rail, bus: s.bus, major: !s.rail && !s.bus },
+      properties: { id: s.id, name: s.name, rail: s.rail, bus: s.bus, ferry: s.ferry, major: !s.rail && !s.bus && !s.ferry },
       geometry: { type: 'Point', coordinates: [s.lng, s.lat] },
     })),
   });
@@ -641,9 +733,8 @@ function applyLayerToggles() {
   const vis = (on: boolean) => (on ? 'visible' : 'none');
   map.setLayoutProperty('speed-lines', 'visibility', vis(layers.speed));
   for (const id of ['bikes', 'bike-counts']) map.setLayoutProperty(id, 'visibility', vis(layers.bikes));
-  for (const kind of ['bus', 'rail', 'subway']) {
-    map.setPaintProperty(`${kind}-lines`, 'line-opacity', layers.speed ? 0.15 : kind === 'subway' ? 1 : 0.85);
-  }
+  for (const kind of LINE_KINDS) map.setPaintProperty(`${kind}-lines`, 'line-opacity', layers.speed ? 0.15 : LINE_OPACITY[kind]);
+  for (const id of ['alert-lines', 'alert-stations']) map.setLayoutProperty(id, 'visibility', vis(layers.alerts));
   $('#speed-legend').hidden = !layers.speed;
   if (layers.speed) drawSpeedMap();
   if (layers.bikes && Date.now() - docksAt > BIKES_MS) refreshDocks();
@@ -658,8 +749,50 @@ function applyLayerToggles() {
 // it's heading to and not at all while stopped. The drawn train follows that
 // estimate with realistic acceleration and braking, and never reverses.
 
+/** A shape run backwards, for a train going the other way along it. */
+function reversed(shapeId: string) {
+  const key = `${shapeId}:reversed`;
+  let t = tracks.get(key);
+  if (!t && network?.shapes.has(shapeId)) tracks.set(key, (t = new Track([...network.shapes.get(shapeId)!].reverse())));
+  return t;
+}
+
+/**
+ * Amtrak has no MBTA shapes of its own, but where it runs on MBTA track it's
+ * on a commuter rail shape. Find the nearest, and run it the way the train
+ * is heading (Amtrak only reports the nearest eighth of a turn, plenty to
+ * tell the two directions apart).
+ */
+function amtrakTrack(v: Vehicle): Track | undefined {
+  if (!network) return;
+  const [x, y] = toLocal(v.lng, v.lat);
+  const near: { id: string; d: number; off: number; length: number }[] = [];
+  for (const [routeId, shapeIds] of network.routeShapes) {
+    if (network.routes.get(routeId)?.type !== 2) continue;
+    for (const id of shapeIds) {
+      const t = trackOf(id);
+      const p = t?.project(x, y);
+      if (t && p && p.off < 150) near.push({ id, ...p, length: t.length });
+    }
+  }
+  if (!near.length) return;
+  // Where shapes share track (the Providence and Stoughton lines to Canton
+  // Junction), take the one that runs furthest, which is the main line.
+  const closest = Math.min(...near.map((n) => n.off));
+  const best = near.filter((n) => n.off < closest + 30).sort((a, b) => b.length - a.length)[0];
+  const t = trackOf(best.id)!;
+  const a = t.at(best.d + 20);
+  const b = t.at(best.d - 20);
+  const along = compass(Math.atan2(a.y - b.y, a.x - b.x));
+  const diff = Math.abs((((v.bearing ?? along) - along + 540) % 360) - 180);
+  return diff > 90 ? reversed(best.id) : t;
+}
+
 function trackFor(v: Vehicle, route: Route): Track | undefined {
   if (!network) return;
+  // Boats go where the water takes them; they glide between reports.
+  if (route.type === 4) return;
+  if (route.type === AMTRAK_TYPE) return amtrakTrack(v);
   const ids = v.shapeId && network.shapes.has(v.shapeId) ? [v.shapeId] : (network.routeShapes.get(route.id) ?? []);
   let best: Track | undefined;
   let bestOff = Infinity;
@@ -676,7 +809,9 @@ function trackFor(v: Vehicle, route: Route): Track | undefined {
 
 /** How far the report is behind the present, capped so a stale one can't fling a train. */
 function reportAge(v: Vehicle) {
-  return Math.min(45_000, Math.max(0, Date.now() - v.updatedAt));
+  // Amtrak's fixes come about once a minute, so allow more catching up.
+  const cap = v.id.startsWith('amtrak-') ? 120_000 : 45_000;
+  return Math.min(cap, Math.max(0, Date.now() - v.updatedAt));
 }
 
 function applyReport(v: Vehicle, now: number) {
@@ -690,8 +825,15 @@ function applyReport(v: Vehicle, now: number) {
 
   const [x, y] = toLocal(v.lng, v.lat);
   const sameTrip = existing && existing.v.tripId === v.tripId;
-  const track = sameTrip && existing.track ? existing.track : trackFor(v, route);
-  const snapped = track?.project(x, y, sameTrip ? existing.base : undefined);
+  let track = sameTrip ? existing.track : undefined;
+  let snapped = track?.project(x, y, existing!.base);
+  // Amtrak's track is a guess from commuter rail shapes; if it has run off
+  // the one it was on (onto a branch, or off MBTA track), guess again.
+  if (track && route.type === AMTRAK_TYPE && snapped!.off > 100) track = undefined;
+  if (!track) {
+    track = trackFor(v, route);
+    snapped = track?.project(x, y);
+  }
   const group = groupOf(route);
 
   if (!existing || !sameTrip || existing.track !== track) {
@@ -772,12 +914,19 @@ function applyReport(v: Vehicle, now: number) {
       if (import.meta.env.DEV) debugJumps.push(estimate(t, now).d - before);
     }
   } else {
+    // Off any track (boats, and Amtrak beyond the T): speed from how far it
+    // went since the last report.
+    if (v.speed != null) t.speed = v.speed;
+    else if (interval > 3000 && interval < 180_000) {
+      const measured = Math.hypot(x - t.tx, y - t.ty) / (interval / 1000);
+      t.speed = t.speed == null ? measured : t.speed * 0.4 + measured * 0.6;
+    }
     t.fx = t.x;
     t.fy = t.y;
     t.tx = x;
     t.ty = y;
     t.start = now;
-    t.dur = POLL_MS;
+    t.dur = isAmtrak(v.id) ? AMTRAK_MS : POLL_MS;
   }
   if (wasMoving && v.status === 'STOPPED_AT') arrive(t, v);
   t.off = snapped?.off ?? Infinity;
@@ -799,7 +948,9 @@ function estimate(t: Train, now: number): { d: number; vel: number } {
   const ms = now - t.baseAt;
   const speed = t.speed ?? TYPICAL_SPEED[t.group] ?? 8;
   if (ms <= 0 || t.v.status === 'STOPPED_AT' || speed < 0.5) return { d: t.base, vel: 0 };
-  let limit = t.base + 800;
+  // No stop to cap at for Amtrak (its stations aren't MBTA stops), so allow
+  // a longer run at its higher speeds.
+  let limit = t.base + (t.group === 'Amtrak' ? 4000 : 800);
   if (t.stopD != null && t.stopD > t.base) limit = Math.min(limit, t.stopD);
   else if (t.stopD != null) return { d: t.base, vel: 0 }; // At or past its stop already.
   // Nor past the end of the line on a guess (only a report can put it there).
@@ -846,7 +997,7 @@ function arrive(t: Train, v: Vehicle) {
 async function poll() {
   if (!network || document.hidden || Date.now() < pausedUntil) return;
   try {
-    const vehicles = await loadVehicles([...network.routes.keys()]);
+    const vehicles = await loadVehicles(mbtaRouteIds);
     const now = performance.now();
     const seen = new Set<string>();
     for (const v of vehicles) {
@@ -854,18 +1005,253 @@ async function poll() {
       seen.add(v.id);
       applyReport(v, now);
     }
-    for (const id of trains.keys()) if (!seen.has(id)) trains.delete(id);
-    if (selection?.kind === 'train' && !trains.has(selection.id)) select(null);
+    for (const id of trains.keys()) if (!seen.has(id) && !isAmtrak(id)) trains.delete(id);
     lastUpdate = Date.now();
     setNotice(null);
-    if (layers.speed) drawSpeedMap();
-    refreshCounts();
-    if (tab === 'following') renderMain();
-    if (selection?.kind === 'train') renderDetail();
-    renderHud();
+    afterPoll();
   } catch (err) {
     handleError(err, 'Can’t reach the MBTA, retrying');
   }
+}
+
+/** Amtrak trains near Boston, from their own feed, about once a minute. */
+async function pollAmtrak() {
+  if (!network || document.hidden) return;
+  let list: AmtrakTrain[];
+  try {
+    list = await loadAmtrak();
+  } catch (err) {
+    // Amtrak is a bonus; the T carries on without it.
+    console.warn(err);
+    return;
+  }
+  const now = performance.now();
+  const seen = new Set<string>();
+  for (const a of list) {
+    if (Date.now() - a.updatedAt > STALE_MS) continue;
+    const routeId = `Amtrak-${a.service}`;
+    if (!network.routes.has(routeId)) {
+      network.routes.set(routeId, {
+        id: routeId,
+        name: `Amtrak ${a.service}`,
+        type: AMTRAK_TYPE,
+        short: a.service,
+        color: AMTRAK_COLOR,
+        destinations: [],
+      });
+    }
+    seen.add(a.id);
+    amtrakInfo.set(a.id, a);
+    applyReport(
+      {
+        id: a.id,
+        label: a.number,
+        routeId,
+        tripId: a.id,
+        tripName: a.number,
+        headsign: a.destination,
+        directionId: 0,
+        lng: a.lng,
+        lat: a.lat,
+        bearing: a.bearing,
+        speed: a.speed,
+        status: a.speed < 0.5 ? 'STOPPED_AT' : 'IN_TRANSIT_TO',
+        stopName: a.upcoming[0]?.name,
+        carriages: null,
+        updatedAt: a.updatedAt,
+      },
+      now,
+    );
+  }
+  for (const id of trains.keys()) {
+    if (isAmtrak(id) && !seen.has(id)) {
+      trains.delete(id);
+      amtrakInfo.delete(id);
+    }
+  }
+  afterPoll();
+  if (tab === 'alerts') renderMain();
+}
+
+/** Brings everything that shows vehicles up to date after new reports. */
+function afterPoll() {
+  if (selection?.kind === 'train' && !trains.has(selection.id)) select(null);
+  if (layers.speed) drawSpeedMap();
+  findBunching();
+  refreshCounts();
+  if (tab === 'following') renderMain();
+  if (selection?.kind === 'train') {
+    if (isAmtrak(selection.id)) upcoming = amtrakStops(selection.id);
+    renderDetail();
+  }
+  renderHud();
+}
+
+function amtrakStops(id: string): UpcomingStop[] {
+  return (amtrakInfo.get(id)?.upcoming ?? []).filter((s) => Number.isFinite(s.at)).map((s) => ({ name: s.name, at: s.at }));
+}
+
+// ---------------------------------------------------------------------------
+// Disruptions: the MBTA's service alerts, and trains running bunched up.
+
+async function refreshAlerts() {
+  if (!network || document.hidden || Date.now() < pausedUntil) return;
+  try {
+    alerts = (await loadAlerts(mbtaRouteIds)).sort((a, b) => b.severity - a.severity || b.updatedAt - a.updatedAt);
+  } catch (err) {
+    if (err instanceof RateLimited) handleError(err, '');
+    else console.warn(err);
+    return;
+  }
+  drawAlerts();
+  renderAlertsBadge();
+  if (tab === 'alerts' || tab === 'lines') renderMain();
+  if (selection && selection.kind !== 'dock') renderDetail();
+}
+
+const serviceAlerts = () => alerts.filter((a) => alertKind(a) === 'service');
+
+/** The stations an alert names, by their own ids or their platforms'. */
+function alertStations(a: Alert) {
+  return [...new Set(a.stops.map((id) => stationByStop.get(id)).filter((s): s is Station => !!s))];
+}
+
+/** Effects that take a stretch of line out of service. */
+const OUT_OF_SERVICE = new Set(['SUSPENSION', 'SHUTTLE', 'NO_SERVICE']);
+const CLOSED = new Set(['STATION_CLOSURE', 'STOP_CLOSURE', 'DOCK_CLOSURE']);
+
+/** The stretch of each route between the first and last stations an alert names. */
+function alertStretches(a: Alert): [number, number][][] {
+  if (!network || !OUT_OF_SERVICE.has(a.effect) || a.trips.length) return [];
+  const points = alertStations(a).map((s) => toLocal(s.lng, s.lat));
+  if (points.length < 2) return [];
+  const out: [number, number][][] = [];
+  for (const routeId of a.routes) {
+    let best: { track: Track; lo: number; hi: number; n: number } | null = null;
+    for (const id of network.routeShapes.get(routeId) ?? []) {
+      const track = trackOf(id);
+      if (!track) continue;
+      const ds = points.map(([x, y]) => track.project(x, y)).filter((p) => p.off < 200).map((p) => p.d);
+      if (ds.length < 2) continue;
+      const lo = Math.min(...ds);
+      const hi = Math.max(...ds);
+      if (!best || ds.length > best.n || (ds.length === best.n && hi - lo > best.hi - best.lo)) best = { track, lo, hi, n: ds.length };
+    }
+    if (best) out.push(stretch(best.track, best.lo, best.hi));
+  }
+  return out;
+}
+
+/** Part of a track as map coordinates, following its curves. */
+function stretch(track: Track, lo: number, hi: number): [number, number][] {
+  const coords = [toLngLat(track.at(lo).x, track.at(lo).y)];
+  for (let i = 0; i < track.cum.length; i++) {
+    if (track.cum[i] > lo && track.cum[i] < hi) coords.push(toLngLat(track.x[i], track.y[i]));
+  }
+  coords.push(toLngLat(track.at(hi).x, track.at(hi).y));
+  return coords;
+}
+
+function drawAlerts() {
+  const lines: GeoJSON.Feature[] = [];
+  const marked = new Set<Station>();
+  for (const a of serviceAlerts()) {
+    const routes = a.routes.map((id) => network?.routes.get(id)).filter((r): r is Route => !!r);
+    if (routes.length && routes.every((r) => hidden.has(groupOf(r)))) continue;
+    const stretches = alertStretches(a);
+    for (const coords of stretches) lines.push({ type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: coords } });
+    if (stretches.length || CLOSED.has(a.effect)) for (const s of alertStations(a)) marked.add(s);
+  }
+  source('alert-lines')?.setData({ type: 'FeatureCollection', features: lines });
+  source('alert-stations')?.setData({
+    type: 'FeatureCollection',
+    features: [...marked].map((s) => ({ type: 'Feature', properties: {}, geometry: { type: 'Point', coordinates: [s.lng, s.lat] } })),
+  });
+}
+
+/** The lines an alert is about, as riders name them. */
+function alertLines(a: Alert) {
+  const names: string[] = [];
+  let color = AMBER;
+  for (const id of a.routes) {
+    const route = network?.routes.get(id);
+    if (!route) continue;
+    const group = GROUPS.find((g) => g.match(route));
+    // Branches and Silver Line routes read better by their own names.
+    const name = group && ['Red', 'Orange', 'Blue', 'Green', 'Mattapan'].includes(group.id) ? group.label : route.name;
+    if (!names.length) color = displayColor(route.color);
+    if (!names.includes(name)) names.push(name);
+  }
+  return { names, color };
+}
+
+/** Service alerts that touch a group, worst first. */
+function groupAlerts(g: Group) {
+  return serviceAlerts().filter((a) => isDisruptive(a) && !a.trips.length && a.routes.some((id) => {
+    const r = network?.routes.get(id);
+    return r && g.match(r);
+  }));
+}
+
+/** Alerts that bear on one train: its trip, its whole route, or the stop it's heading to. */
+function trainAlerts(t: Train) {
+  const next = t.v.stopName;
+  return serviceAlerts().filter(
+    (a) =>
+      (t.v.tripId && a.trips.includes(t.v.tripId)) ||
+      (a.routes.includes(t.v.routeId) && !a.trips.length && (!a.stops.length || alertStations(a).some((s) => s.name === next))),
+  );
+}
+
+/** Alerts at a station: closures, elevators, and anything on a stretch through it. */
+function stationAlerts(s: Station) {
+  const ids = new Set([s.id, ...s.children]);
+  return alerts.filter((a) => a.stops.some((id) => ids.has(id)));
+}
+
+// Bunching: two trains on the same line and direction running nose to tail,
+// which leaves a long wait behind them. The closest gap, between the back of
+// one and the front of the next, that counts as bunched:
+const BUNCH_GAP: Record<string, number> = { Red: 400, Orange: 400, Blue: 300, Green: 150, Mattapan: 150, SL: 150 };
+
+interface Bunch {
+  behind: Train;
+  ahead: Train;
+  gap: number;
+}
+let bunches: Bunch[] = [];
+const bunched = new Set<string>();
+
+function findBunching() {
+  const byRoute = new Map<string, Train[]>();
+  for (const t of trains.values()) {
+    if (!BUNCH_GAP[t.group] || !t.track || t.off > 60) continue;
+    const key = `${t.v.routeId}|${t.v.directionId}`;
+    byRoute.set(key, [...(byRoute.get(key) ?? []), t]);
+  }
+  const out: Bunch[] = [];
+  const pos = { x: 0, y: 0 };
+  for (const list of byRoute.values()) {
+    for (const a of list) {
+      const track = a.track!;
+      // Trains wait their turn at either end of the line; that's not bunching.
+      if (a.d < 600 || a.d > track.length - 600) continue;
+      let next: { t: Train; gap: number } | null = null;
+      for (const b of list) {
+        if (b === a) continue;
+        b.track!.at(b.d, pos);
+        const p = track.project(pos.x, pos.y, a.d);
+        if (p.off > 40 || p.d > track.length - 600) continue;
+        const gap = p.d - a.d - (a.length + b.length) / 2;
+        if (p.d > a.d && (!next || gap < next.gap)) next = { t: b, gap };
+      }
+      if (next && next.gap < BUNCH_GAP[a.group]) out.push({ behind: a, ahead: next.t, gap: Math.max(0, next.gap) });
+    }
+  }
+  bunches = out;
+  bunched.clear();
+  for (const b of out) bunched.add(b.behind.v.id).add(b.ahead.v.id);
+  if (tab === 'alerts') renderMain();
 }
 
 function handleError(err: unknown, message: string) {
@@ -937,7 +1323,9 @@ function layout(train: Train, s: ReturnType<typeof exaggeration>, now: number, s
       accent: train.accent,
       selected,
       followed: starred,
-      roll: sway * Math.sin(now / 480 + train.phase + i * 0.8),
+      // Boats rock gently even at rest.
+      roll: spec.boat ? 0.02 * Math.sin(now / 900 + train.phase) : sway * Math.sin(now / 480 + train.phase + i * 0.8),
+      boat: spec.boat,
     });
     carOwners.push(train.v.id);
     offset += len + train.gap * s.length;
@@ -989,6 +1377,7 @@ function drawDots(selectedId: string | null) {
         color: `#${t.accent.getHexString()}`,
         selected: t.v.id === selectedId,
         followed: isFollowed(t.v.id),
+        bunched: bunched.has(t.v.id),
         small: t.route.type >= 2,
       },
       geometry: { type: 'Point', coordinates: toLngLat(t.x, t.y) },
@@ -1024,7 +1413,7 @@ function driveCamera(now: number) {
   // Never steer while someone has their hands on the map: moving the camera
   // resets MapLibre's gesture handlers, so a pinch or twist could never start.
   const busy = handsOn(now);
-  if (wasBusy && !busy && cameraMode === 'ride') {
+  if (wasBusy && !busy && riding()) {
     // They turned to look around; keep that view for a moment.
     rideLook = (((map.getBearing() - rideBearing + 540) % 360) - 180);
     lookedAt = now;
@@ -1042,6 +1431,10 @@ function driveCamera(now: number) {
     map.setCenter(toLngLat(t.x, t.y));
     return;
   }
+  if (cameraMode === 'cab') {
+    driveCab(t, now, dt);
+    return;
+  }
   // Ride along: sit behind the train and turn with the track, smoothly.
   const target = compass(t.heading);
   const delta = ((target - rideBearing + 540) % 360) - 180;
@@ -1054,6 +1447,51 @@ function driveCamera(now: number) {
     center: toLngLat(t.x + Math.cos(t.heading) * ahead, t.y + Math.sin(t.heading) * ahead),
     bearing: rideBearing + rideLook,
   });
+}
+
+/** Looking ahead from the cab: just under level, so the horizon sits high in the view. */
+const CAB_PITCH = 82;
+/** Where the camera eased from on entering the cab, to blend into the moving view. */
+let cabFrom: { center: maplibregl.LngLat; zoom: number; pitch: number; bearing: number; at: number } | null = null;
+
+/** The driver's view: from the front of the lead car at eye height, looking down the line. */
+function driveCab(t: Train, now: number, dt: number) {
+  const lead = t.cars[0];
+  const half = t.length / 2;
+  const eye = { x: 0, y: 0 };
+  const ahead = { x: 0, y: 0 };
+  if (t.track) {
+    t.track.at(t.d + half + 0.5, eye);
+    // Face where the track goes next, so curves come into view as they do from a cab.
+    t.track.at(t.d + half + 45, ahead);
+  } else {
+    const ux = Math.cos(t.heading);
+    const uy = Math.sin(t.heading);
+    eye.x = t.x + ux * (half + 0.5);
+    eye.y = t.y + uy * (half + 0.5);
+    ahead.x = eye.x + ux;
+    ahead.y = eye.y + uy;
+  }
+  const target = compass(Math.atan2(ahead.y - eye.y, ahead.x - eye.x));
+  const delta = ((target - rideBearing + 540) % 360) - 180;
+  rideBearing = (rideBearing + delta * (1 - Math.exp(-dt / 0.45)) + 360) % 360;
+  if (now - lookedAt > 4000) rideLook *= Math.exp(-dt / 1.2);
+  // A driver's eyes sit about three quarters of the way up the cab; a ferry's bridge is up top.
+  const height = lead.boat ? lead.height * 1.15 : lead.height * 0.78;
+  const cam = map.calculateCameraOptionsFromCameraLngLatAltRotation(toLngLat(eye.x, eye.y), height, rideBearing + rideLook, CAB_PITCH);
+  if (cabFrom) {
+    // Glide in from wherever the camera was, rather than cutting.
+    const k = Math.min(1, (now - cabFrom.at) / 1800);
+    const e = k < 0.5 ? 4 * k ** 3 : 1 - (-2 * k + 2) ** 3 / 2;
+    const to = maplibregl.LngLat.convert(cam.center!);
+    const turn = ((cam.bearing! - cabFrom.bearing + 540) % 360) - 180;
+    cam.center = [cabFrom.center.lng + (to.lng - cabFrom.center.lng) * e, cabFrom.center.lat + (to.lat - cabFrom.center.lat) * e];
+    cam.zoom = cabFrom.zoom + (cam.zoom! - cabFrom.zoom) * e;
+    cam.pitch = cabFrom.pitch + (CAB_PITCH - cabFrom.pitch) * e;
+    cam.bearing = cabFrom.bearing + turn * e;
+    if (k >= 1) cabFrom = null;
+  }
+  map.jumpTo(cam);
 }
 
 // ---------------------------------------------------------------------------
@@ -1097,7 +1535,7 @@ for (const type of ['pointerup', 'pointercancel', 'pointerleave'] as const) {
 function spin(degrees: number) {
   const now = performance.now();
   lastInteraction = now;
-  if (cameraMode === 'ride') {
+  if (riding()) {
     rideLook = (((rideLook + degrees + 540) % 360) - 180);
     lookedAt = now;
     map.setBearing(rideBearing + rideLook);
@@ -1151,7 +1589,7 @@ mapEl.addEventListener('gesturechange', (e) => {
   const now = performance.now();
   lastWheel = now;
   lastInteraction = now;
-  if (cameraMode === 'ride') {
+  if (riding()) {
     rideLook = gestureFrom.look - g.rotation;
     lookedAt = now;
     map.setBearing(rideBearing + rideLook);
@@ -1167,10 +1605,29 @@ mapEl.addEventListener('gestureend', (e) => {
 });
 
 function setCameraMode(mode: CameraMode) {
+  const was = cameraMode;
   cameraMode = mode;
-  document.body.classList.toggle('cinematic', mode === 'ride');
+  document.body.classList.toggle('cinematic', riding());
+  document.body.classList.toggle('cab', mode === 'cab');
   const t = selection?.kind === 'train' ? trains.get(selection.id) : undefined;
   updatePadding(true);
+  if (mode === 'cab') {
+    // The cab view looks nearly level and sits a few meters off the ground.
+    map.setMaxPitch(85);
+    map.setMaxZoom(24);
+    const c = map.getCenter();
+    cabFrom = { center: c, zoom: map.getZoom(), pitch: map.getPitch(), bearing: map.getBearing(), at: performance.now() };
+    if (t && was !== 'ride') rideBearing = compass(t.heading);
+    map.stop();
+  } else if (was === 'cab') {
+    cabFrom = null;
+    // Lift out of the cab before putting the limits back, or the view snaps.
+    map.once('moveend', () => {
+      if (cameraMode === 'cab') return;
+      map.setMaxZoom(22);
+      map.setMaxPitch(flat() ? 0 : 78);
+    });
+  }
   if (t && mode === 'ride') {
     rideBearing = compass(t.heading);
     rideLook = 0;
@@ -1179,9 +1636,11 @@ function setCameraMode(mode: CameraMode) {
       zoom: t.route.type === 2 ? 17.4 : 18,
       pitch: flat() ? 0 : 72,
       bearing: rideBearing,
-      duration: 2200,
+      duration: was === 'cab' ? 1400 : 2200,
       essential: true,
     });
+  } else if (was === 'cab' && mode !== 'ride') {
+    map.easeTo({ pitch: flat() ? 0 : 60, zoom: 16.5, duration: 1400 });
   } else if (t && mode === 'follow') {
     map.easeTo({
       center: toLngLat(t.x, t.y),
@@ -1190,7 +1649,7 @@ function setCameraMode(mode: CameraMode) {
       duration: 1500,
     });
   }
-  if (mode !== 'ride' && touring) setTouring(false);
+  if (!riding() && touring) setTouring(false);
   renderDetail();
   renderHud();
 }
@@ -1242,7 +1701,7 @@ function featureAt(point: maplibregl.Point, layerIds: string[]) {
 }
 
 map.on('click', (e) => {
-  if (cameraMode === 'ride') return;
+  if (riding()) return;
   const train = trainAt(e.point);
   if (train) return select({ kind: 'train', id: train });
   const station = featureAt(e.point, ['stations']);
@@ -1283,7 +1742,11 @@ const $ = <T extends HTMLElement = HTMLElement>(sel: string) => document.querySe
 const sheetEl = $('#sheet');
 const mainEl = $('#view-main');
 const detailEl = $('#view-detail');
+const searchView = $('#view-search');
+const searchEl = $<HTMLInputElement>('#search');
+const commuteEl = $('#commute');
 const hudEl = $('#hud');
+const toastEl = $('#toast');
 const sheet = new Sheet(sheetEl, [$('.grabber'), $('.top'), $('.tabs')], () => updatePadding());
 
 function escape(s: string) {
@@ -1301,6 +1764,25 @@ const ICON = {
     '<svg viewBox="0 0 20 20"><path d="M3.5 13.5a6.5 6.5 0 1 1 13 0" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><path d="M10 13.5 13.5 8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>',
   bike: '<svg viewBox="0 0 20 20"><circle cx="5" cy="13" r="3" fill="none" stroke="currentColor" stroke-width="1.5"/><circle cx="15" cy="13" r="3" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M5 13 8 7h4.5L15 13M8 7l2 6M11.5 5H14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>',
   rain: '<svg viewBox="0 0 20 20"><path d="M6 12.5a3.5 3.5 0 0 1 .4-7A4.5 4.5 0 0 1 15 7a3 3 0 0 1 0 5.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><path d="m8 14-1 2.5M11.5 14l-1 2.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>',
+  alert:
+    '<svg viewBox="0 0 20 20"><path d="M10 3.2 17.4 16H2.6z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M10 8.2v3.6" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><circle cx="10" cy="13.9" r="1" fill="currentColor"/></svg>',
+  pin: '<svg viewBox="0 0 16 16"><path d="M8 14.5s4.5-4.2 4.5-7.8a4.5 4.5 0 0 0-9 0c0 3.6 4.5 7.8 4.5 7.8z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><circle cx="8" cy="6.6" r="1.6" fill="currentColor"/></svg>',
+  pinOn:
+    '<svg viewBox="0 0 16 16"><path d="M8 14.5s4.5-4.2 4.5-7.8a4.5 4.5 0 0 0-9 0c0 3.6 4.5 7.8 4.5 7.8z" fill="currentColor"/><circle cx="8" cy="6.6" r="1.7" fill="#0a0c10"/></svg>',
+  chevron: '<svg viewBox="0 0 16 16"><path d="m4.5 6.5 3.5 3.5 3.5-3.5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+  cab: '<svg viewBox="0 0 16 16"><rect x="2.5" y="2.5" width="11" height="8" rx="2" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M2.5 7.2h11M5 13.5l1.2-3M11 13.5l-1.2-3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>',
+  chase: '<svg viewBox="0 0 16 16"><path d="M3 12.5 8 3l5 9.5-5-2.6z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>',
+  bell: '<svg viewBox="0 0 20 20"><path d="M5.5 13.5V9a4.5 4.5 0 0 1 9 0v4.5l1.5 1.5H4z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><path d="M8.3 17a1.9 1.9 0 0 0 3.4 0" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>',
+  walk: '<svg viewBox="0 0 20 20"><circle cx="11" cy="3.8" r="1.6" fill="currentColor"/><path d="m7.5 18 2.2-5.2 2.3 2.2v3M9.7 12.8l.8-4.8-2.6 1.2-1 2.6M10.5 8l2 2.4 2.5.8" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+  install:
+    '<svg viewBox="0 0 20 20"><rect x="5" y="2.5" width="10" height="15" rx="2.2" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M10 6.5v6M7.5 10l2.5 2.5 2.5-2.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+  share:
+    '<svg viewBox="0 0 16 16"><path d="M8 10V2M5 4.5 8 1.8l3 2.7M4.5 7H3.5v7h9V7h-1" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+  train:
+    '<svg viewBox="0 0 16 16"><rect x="3.5" y="1.8" width="9" height="10" rx="2.4" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M3.5 7.2h9M5.5 14.5l1-2.5M10.5 14.5l-1-2.5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>',
+  station: '<svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="4.5" fill="none" stroke="currentColor" stroke-width="2"/></svg>',
+  search:
+    '<svg viewBox="0 0 16 16"><circle cx="7" cy="7" r="4.6" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="m10.5 10.5 3.5 3.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>',
 };
 
 function setNotice(message: string | null) {
@@ -1343,17 +1825,25 @@ function tick() {
     const el = hudEl.querySelector('[data-tour-left]');
     if (el) el.textContent = `${left}s`;
   }
+  renderCommute();
+  remindIfTime();
 }
 
 function ago(at: number) {
   const s = Math.max(0, Math.round((Date.now() - at) / 1000));
-  return s < 60 ? `${s}s ago` : `${Math.round(s / 60)} min ago`;
+  if (s < 60) return `${s}s ago`;
+  if (s < 3600) return `${Math.round(s / 60)} min ago`;
+  if (s < 86_400) return `${Math.round(s / 3600)} hr ago`;
+  const days = Math.round(s / 86_400);
+  return `${days} day${days === 1 ? '' : 's'} ago`;
 }
 
 function countdown(at: number) {
   const s = Math.round((at - Date.now()) / 1000);
   if (s <= 30) return 'Now';
   if (s < 90) return '1 min';
+  // An hour or more out, the time reads better than the wait.
+  if (s >= 3600) return clockFmt.format(at);
   return `${Math.round(s / 60)} min`;
 }
 
@@ -1364,7 +1854,7 @@ function renderConditions() {
 
 function groupColor(g: Group) {
   const route = network && [...network.routes.values()].find(g.match);
-  return route ? displayColor(route.color) : '#777';
+  return route ? displayColor(route.color) : (g.color ?? '#777');
 }
 
 function groupRoutes(g: Group) {
@@ -1376,47 +1866,70 @@ function groupSubtitle(g: Group) {
   if (g.id === 'Green') return 'B · C · D · E branches';
   if (g.id === 'SL') return routes.map((r) => r.short).join(' · ');
   if (g.id === 'CR') return routes.length ? `${routes.length} lines from North & South Station` : '';
+  if (g.id === 'Ferry') return routes.length ? `${routes.length} routes across the harbor` : 'Across the harbor';
+  if (g.id === 'Amtrak') return 'On the T’s tracks into South & North Station';
   const [to0, to1] = routes[0]?.destinations ?? [];
   return to0 && to1 ? `${to1} ↔ ${to0}` : '';
 }
+
+function hex(t: Train) {
+  return `#${t.accent.getHexString()}`;
+}
+
+const titleCase = (s: string) => s.toLowerCase().replace(/\b[a-z]/g, (c) => c.toUpperCase());
 
 // Tabs -------------------------------------------------------------------------
 
 function setTab(next: Tab) {
   tab = next;
   sheetEl.dataset.tab = next;
-  document.querySelectorAll<HTMLButtonElement>('[data-tab]').forEach((b) => b.setAttribute('aria-selected', String(b.dataset.tab === next)));
+  document.querySelectorAll<HTMLButtonElement>('.tabs [data-tab]').forEach((b) => b.setAttribute('aria-selected', String(b.dataset.tab === next)));
   if (selection) select(null);
+  closeSearch();
   renderMain(true);
   sheet.reveal();
 }
 
 function renderMain(enter = false) {
+  // Keep the reader's place when a list refreshes under them.
+  const scroll = enter ? 0 : mainEl.scrollTop;
   mainEl.classList.toggle('enter', enter);
   if (tab === 'lines') renderLines();
+  else if (tab === 'alerts') renderAlertsTab();
   else if (tab === 'following') renderFollowing();
   else renderMapTab();
+  mainEl.scrollTop = scroll;
   renderFollowingBadge();
 }
 
-function renderLines() {
+function groupCounts() {
   const counts = new Map<string, number>();
   for (const t of trains.values()) counts.set(t.group, (counts.get(t.group) ?? 0) + 1);
+  return counts;
+}
+
+function renderLines() {
+  const counts = groupCounts();
   mainEl.innerHTML = `
     <ul class="lines">
       ${GROUPS.map((g, i) => {
         const on = !hidden.has(g.id);
-        return `<li class="line${on ? '' : ' off'}" style="--c:${groupColor(g)};--i:${i}">
+        const issues = groupAlerts(g);
+        const flag = issues.length
+          ? `<em class="flag" data-show-alerts title="${escape(issues[0].header)}">${effectLabel(issues[0].effect)}${issues.length > 1 ? ` +${issues.length - 1}` : ''}</em>`
+          : '';
+        const divider = g.id === 'Amtrak' ? `<li class="lines-divider" style="--i:${i}"><span>Sharing the rails</span></li>` : '';
+        return `${divider}<li class="line${on ? '' : ' off'}" style="--c:${groupColor(g)};--i:${i}">
           <button class="line-main" data-focus="${g.id}" title="Show the ${g.label} on the map">
             <span class="line-swatch"></span>
-            <span class="line-text"><strong>${g.label}</strong><small>${escape(groupSubtitle(g))}</small></span>
-            <span class="line-count"><b data-count="${g.id}">${counts.get(g.id) ?? 0}</b><small>${g.id === 'SL' ? 'buses' : 'trains'}</small></span>
+            <span class="line-text"><strong>${g.label}${flag}</strong><small>${escape(groupSubtitle(g))}</small></span>
+            <span class="line-count"><b data-count="${g.id}">${counts.get(g.id) ?? 0}</b><small>${g.unit}</small></span>
           </button>
           <button class="switch" role="switch" aria-checked="${on}" aria-label="Show ${g.label}" data-toggle="${g.id}"></button>
         </li>`;
       }).join('')}
     </ul>
-    <button class="cta" data-action="tour" style="--i:${GROUPS.length}">
+    <button class="cta" data-action="tour" style="--i:${GROUPS.length + 1}">
       <span class="cta-icon">${ICON.play}</span>
       <span><strong>Take the tour</strong><small>Ride along with trains across the city</small></span>
     </button>`;
@@ -1424,8 +1937,7 @@ function renderLines() {
 
 /** Updates the live numbers in place, without redrawing the list. */
 function refreshCounts() {
-  const counts = new Map<string, number>();
-  for (const t of trains.values()) counts.set(t.group, (counts.get(t.group) ?? 0) + 1);
+  const counts = groupCounts();
   document.querySelectorAll<HTMLElement>('[data-count]').forEach((el) => {
     el.textContent = String(counts.get(el.dataset.count!) ?? 0);
   });
@@ -1433,6 +1945,8 @@ function refreshCounts() {
 }
 
 function vehicleLabel(t: Train) {
+  if (t.route.type === AMTRAK_TYPE) return `Amtrak ${t.v.label}`;
+  if (t.route.type === 4) return titleCase(t.v.label);
   if (t.route.type === 2 && t.v.tripName) return `Train ${t.v.tripName}`;
   return `${t.route.type === 3 ? 'Bus' : 'Car'} ${t.v.label}`;
 }
@@ -1450,6 +1964,13 @@ function destination(t: Train) {
 
 function mph(t: Train) {
   return t.speed != null && t.v.status !== 'STOPPED_AT' ? Math.round(t.speed * 2.237) : null;
+}
+
+/** "On time", "12 min late" for Amtrak, which publishes how late it's running. */
+function lateness(id: string) {
+  const late = amtrakInfo.get(id)?.late;
+  if (late == null) return null;
+  return late >= 3 ? { text: `${late} min late`, late: true } : { text: 'On time', late: false };
 }
 
 function renderFollowing() {
@@ -1485,6 +2006,215 @@ function renderFollowing() {
     .join('')}</ul>`;
 }
 
+// Alerts tab -------------------------------------------------------------------
+
+/** Alert cards the reader has opened, kept open across refreshes. */
+const openAlerts = new Set<string>();
+
+function lineList(names: string[]) {
+  if (names.length <= 2) return names.join(', ');
+  return `${names.slice(0, 2).join(', ')} +${names.length - 2}`;
+}
+
+function alertCard(a: Alert, i: number) {
+  const { names, color } = alertLines(a);
+  const cause = causeLabel(a.cause);
+  const outside = EXTERNAL.has(a.cause);
+  const canShow = alertStations(a).length > 0 || a.routes.some((id) => network?.routeShapes.has(id));
+  return `<li style="--c:${color};--i:${i}">
+    <details class="alert${isDisruptive(a) ? ' severe' : ''}" data-alert="${escape(a.id)}"${openAlerts.has(a.id) ? ' open' : ''}>
+      <summary>
+        <span class="card-bar"></span>
+        <span class="alert-text">
+          <small>${escape(lineList(names) || 'MBTA')} · ${escape(effectLabel(a.effect))}</small>
+          <strong>${escape(a.header)}</strong>
+          <span class="chips">${cause ? `<em class="chip${outside ? ' outside' : ''}">${escape(cause)}</em>` : ''}<span>Updated <span data-ago="${a.updatedAt}">${ago(a.updatedAt)}</span></span></span>
+        </span>
+        <span class="chev">${ICON.chevron}</span>
+      </summary>
+      <div class="alert-body">
+        ${a.description ? `<p>${escape(a.description).replace(/\n{2,}/g, '</p><p>').replace(/\n/g, '<br>')}</p>` : ''}
+        <div class="alert-actions">
+          ${canShow ? `<button class="btn small" data-alert-map="${escape(a.id)}">Show on map</button>` : ''}
+          ${a.url ? `<a class="btn small" href="${escape(a.url)}" target="_blank" rel="noopener">More on mbta.com</a>` : ''}
+        </div>
+      </div>
+    </details>
+  </li>`;
+}
+
+function feet(m: number) {
+  return Math.max(10, Math.round((m * 3.281) / 10) * 10).toLocaleString();
+}
+
+function bunchCard(b: Bunch, i: number) {
+  const t = b.behind;
+  const branch = t.v.routeId.startsWith('Green-') ? ` · ${t.v.routeId.slice(-1)} branch` : '';
+  return `<li style="--c:${hex(t)};--i:${i}">
+    <button class="card" data-train="${escape(t.v.id)}">
+      <span class="card-bar"></span>
+      <span class="card-text">
+        <small>${escape(t.route.name)}${branch}</small>
+        <strong>To ${escape(destination(t))}</strong>
+        <span>Near ${escape(b.ahead.v.stopName ?? b.behind.v.stopName ?? 'the next stop')}</span>
+      </span>
+      <span class="card-side"><b>${feet(b.gap)}</b><small>ft apart</small></span>
+    </button>
+  </li>`;
+}
+
+/** Things beyond the T that hold it up: Amtrak, freight, drawbridges, the harbor. */
+function outsideHtml() {
+  const amtrak = [...trains.values()].filter((t) => t.group === 'Amtrak');
+  const late = amtrak
+    .map((t) => ({ t, late: amtrakInfo.get(t.v.id)?.late ?? 0 }))
+    .filter((x) => x.late >= 5)
+    .sort((a, b) => b.late - a.late);
+  const external = alerts.filter((a) => EXTERNAL.has(a.cause));
+  const rows: string[] = [];
+  rows.push(`<li style="--c:${AMTRAK_COLOR}">
+    <button class="card" data-focus="Amtrak">
+      <span class="card-bar"></span>
+      <span class="card-text">
+        <small>Amtrak</small>
+        <strong>${amtrak.length ? `${amtrak.length} train${amtrak.length === 1 ? '' : 's'} near Boston` : 'No Amtrak trains near Boston'}</strong>
+        <span>${
+          !amtrak.length
+            ? 'They share the Providence, Worcester and Haverhill lines'
+            : late.length
+              ? late.map((x) => `${escape(vehicleLabel(x.t))} ${x.late} min late`).slice(0, 2).join(' · ')
+              : 'All running on time'
+        }</span>
+      </span>
+      <span class="card-side"><b>${late.length}</b><small>late</small></span>
+    </button>
+  </li>`);
+  for (const a of external) {
+    const { names, color } = alertLines(a);
+    rows.push(`<li style="--c:${color}">
+      <button class="card" data-open-alert="${escape(a.id)}">
+        <span class="card-bar"></span>
+        <span class="card-text">
+          <small>${escape(lineList(names))}</small>
+          <strong>${escape(causeLabel(a.cause) ?? effectLabel(a.effect))}</strong>
+          <span>${escape(a.summary || a.header)}</span>
+        </span>
+      </button>
+    </li>`);
+  }
+  return `<ul class="cards">${rows.join('')}</ul>
+    <p class="fine tight">${
+      external.length ? '' : 'No freight, drawbridge or harbor holdups reported right now. '
+    }Freight railroads don’t publish where their trains are, so a freight delay shows up here when the MBTA reports it.</p>`;
+}
+
+function renderAlertsTab() {
+  if (!network) {
+    mainEl.innerHTML = '<p class="muted">Loading…</p>';
+    return;
+  }
+  const shown = (a: Alert) => {
+    const routes = a.routes.map((id) => network!.routes.get(id)).filter((r): r is Route => !!r);
+    return !routes.length || routes.some((r) => !hidden.has(groupOf(r)));
+  };
+  const service = serviceAlerts().filter(shown);
+  const disruptive = service.filter(isDisruptive);
+  const minor = service.filter((a) => !isDisruptive(a));
+  const access = alerts.filter((a) => alertKind(a) === 'access' && shown(a));
+  const notices = alerts.filter((a) => alertKind(a) === 'notice' && shown(a));
+  const bunch = bunches.filter((b) => !hidden.has(b.behind.group));
+  let i = 0;
+  const cards = (list: Alert[]) => `<ul class="cards">${list.map((a) => alertCard(a, i++)).join('')}</ul>`;
+
+  mainEl.innerHTML = `
+    <div class="tally" style="--i:0">
+      <div class="${disruptive.length ? 'bad' : 'good'}"><b>${disruptive.length}</b><small>${disruptive.length === 1 ? 'Disruption' : 'Disruptions'}</small></div>
+      <div class="${bunch.length ? 'bad' : 'good'}"><b>${bunch.length}</b><small>Bunched</small></div>
+      <div><b>${access.length}</b><small>Elevators & ramps</small></div>
+    </div>
+    <section class="group" style="--i:1">
+      <h3>Service</h3>
+      ${
+        disruptive.length || minor.length
+          ? cards([...disruptive, ...minor])
+          : `<div class="all-good"><span class="pulse" aria-hidden="true"></span>Good service on every line</div>`
+      }
+    </section>
+    ${
+      bunch.length
+        ? `<section class="group" style="--i:2">
+            <h3>Bunched trains</h3>
+            <ul class="cards">${bunch.map((b, k) => bunchCard(b, k)).join('')}</ul>
+            <p class="fine tight">Trains running nose to tail, which usually means a long gap behind them.</p>
+          </section>`
+        : ''
+    }
+    <section class="group" style="--i:3">
+      <h3>From outside the T</h3>
+      ${outsideHtml()}
+    </section>
+    ${
+      access.length
+        ? `<section class="group" style="--i:4">
+            <details class="fold"${openAlerts.has('fold:access') ? ' open' : ''} data-alert="fold:access">
+              <summary><h3>Elevators & escalators <span>${access.length}</span></h3>${ICON.chevron}</summary>
+              ${cards(access)}
+            </details>
+          </section>`
+        : ''
+    }
+    ${
+      notices.length
+        ? `<section class="group" style="--i:5">
+            <details class="fold"${openAlerts.has('fold:notices') ? ' open' : ''} data-alert="fold:notices">
+              <summary><h3>Notices <span>${notices.length}</span></h3>${ICON.chevron}</summary>
+              ${cards(notices)}
+            </details>
+          </section>`
+        : ''
+    }
+    <p class="credits" style="--i:6">Alerts from the MBTA, refreshed every minute and a half. Bunching is worked out here from live train positions.</p>`;
+}
+
+mainEl.addEventListener(
+  'toggle',
+  (e) => {
+    const el = e.target as HTMLDetailsElement;
+    const id = el.dataset?.alert;
+    if (!id) return;
+    if (el.open) openAlerts.add(id);
+    else openAlerts.delete(id);
+  },
+  true,
+);
+
+function renderAlertsBadge() {
+  const badge = $('#alerts-count');
+  const n = serviceAlerts().filter(isDisruptive).length;
+  badge.textContent = String(n);
+  badge.hidden = !n;
+}
+
+/** Frames everything an alert names: its stations, or failing that, its lines. */
+function showAlert(id: string) {
+  const a = alerts.find((x) => x.id === id);
+  if (!a || !network) return;
+  const bounds = new maplibregl.LngLatBounds();
+  for (const coords of alertStretches(a)) for (const p of coords) bounds.extend(p);
+  for (const s of alertStations(a)) bounds.extend([s.lng, s.lat]);
+  if (bounds.isEmpty()) for (const r of a.routes) for (const s of network.routeShapes.get(r) ?? []) for (const p of network.shapes.get(s) ?? []) bounds.extend(p);
+  if (bounds.isEmpty()) return;
+  if (!layers.alerts) {
+    layers.alerts = true;
+    save(LAYERS_KEY, layers);
+    applyLayerToggles();
+  }
+  if (isPhone()) sheet.set('peek');
+  map.fitBounds(bounds, { padding: 72, maxZoom: 15.5, pitch: flat() ? 0 : 45, bearing: flat() ? 0 : map.getBearing(), duration: 1500 });
+}
+
+// Map tab ----------------------------------------------------------------------
+
 function sunPhase() {
   if (sky.day > 0.85) return 'Daylight';
   if (sky.dusk > 0.25 || sky.day > 0.1) {
@@ -1506,9 +2236,31 @@ function legendHtml() {
   return `${SPEED_SCALE.map(([v, c], i) => `<span style="--c:${c}">${SPEED_SCALE[i + 1] ? v : `${v}+`}</span>`).join('')}<em>mph</em>`;
 }
 
+function installHtml() {
+  const mode = installMode();
+  if (mode === 'prompt')
+    return `<div class="setting">
+      <span class="setting-icon">${ICON.install}</span>
+      <span class="setting-text"><strong>Get the app</strong><small>Install Live Boston on this device</small></span>
+      <button class="btn small light" data-action="install">Install</button>
+    </div>`;
+  if (mode === 'ios')
+    return `<div class="setting">
+      <span class="setting-icon">${ICON.install}</span>
+      <span class="setting-text"><strong>Get the app</strong><small>Tap Share <span class="inline-icon">${ICON.share}</span> then Add to Home Screen</small></span>
+    </div>`;
+  if (mode === 'installed')
+    return `<div class="setting">
+      <span class="setting-icon">${ICON.install}</span>
+      <span class="setting-text"><strong>Installed</strong><small>You’re using the Live Boston app</small></span>
+    </div>`;
+  return '';
+}
+
 function renderMapTab() {
   const { rise, set } = sunTimes(skyTime());
   const bikes = docks.reduce((n, d) => n + d.bikes + d.ebikes, 0);
+  const app = installHtml();
   mainEl.innerHTML = `
     <section class="group" style="--i:0">
       <h3>View</h3>
@@ -1519,6 +2271,7 @@ function renderMapTab() {
     </section>
     <section class="group" style="--i:1">
       <h3>Layers</h3>
+      ${setting('alerts', ICON.alert, 'Disruptions', 'Suspended stretches and closed stations in amber')}
       ${setting('speed', ICON.gauge, 'Speed map', 'Track colored by how fast trains really move')}
       ${layers.speed ? `<div class="legend">${legendHtml()}</div>` : ''}
       ${setting(
@@ -1529,7 +2282,8 @@ function renderMapTab() {
       )}
       ${setting('weather', ICON.rain, 'Weather', 'Live rain and snow over the city')}
     </section>
-    <section class="group" style="--i:2">
+    ${app ? `<section class="group" style="--i:2"><h3>App</h3>${app}</section>` : ''}
+    <section class="group" style="--i:3">
       <h3>Moving around</h3>
       <ul class="moves">
         ${(touchFirst
@@ -1542,13 +2296,14 @@ function renderMapTab() {
               ['Spin', 'Swipe sideways with two fingers, or right-drag'],
               ['Tilt', 'Ctrl-drag, or right-drag up and down'],
               ['Zoom', 'Pinch, or scroll'],
+              ['Find', 'Press / to search'],
             ]
         )
           .map(([k, v]) => `<li><b>${k}</b><span>${v}</span></li>`)
           .join('')}
       </ul>
     </section>
-    <section class="group" style="--i:3">
+    <section class="group" style="--i:4">
       <h3>Sky over Boston</h3>
       <div class="sky">
         <div><small>Now</small><strong>${sunPhase()}</strong></div>
@@ -1556,8 +2311,10 @@ function renderMapTab() {
         <div><small>Sunset</small><strong>${set ? clockFmt.format(set) : '—'}</strong></div>
       </div>
     </section>
-    <p class="credits" style="--i:4">Live data from the MBTA, Bluebikes and Open-Meteo. Map data © OpenStreetMap contributors, OpenMapTiles.</p>`;
+    <p class="credits" style="--i:5">Live data from the MBTA, Amtrak (via Amtraker), Bluebikes and Open-Meteo. Map data © OpenStreetMap contributors, OpenMapTiles.</p>`;
 }
+
+onInstallChange(() => tab === 'map' && renderMain());
 
 function renderFollowingBadge() {
   const badge = $('#following-count');
@@ -1596,6 +2353,13 @@ function select(next: Selection, keepTour = false) {
 async function refreshPanelData() {
   if (document.hidden || !selection || selection.kind === 'dock') return;
   const sel = selection;
+  // Amtrak's own feed already carries its stops.
+  if (sel.kind === 'train' && isAmtrak(sel.id)) {
+    upcoming = amtrakStops(sel.id);
+    renderDetail();
+    renderHud();
+    return;
+  }
   try {
     if (sel.kind === 'train') {
       const tripId = trains.get(sel.id)?.v.tripId;
@@ -1605,6 +2369,8 @@ async function refreshPanelData() {
     } else {
       const deps = await loadDepartures(sel.id);
       if (selection === sel) departures = deps;
+      // The same answer serves the commute card, saving a request.
+      if (commute?.stationId === sel.id) setCommuteDepartures(deps);
     }
     if (selection === sel) {
       renderDetail();
@@ -1617,7 +2383,7 @@ async function refreshPanelData() {
 
 /** Keeps the map's center clear of the sidebar or sheet, so centered things stay in view. */
 function updatePadding(immediate = false) {
-  const cinematic = cameraMode === 'ride';
+  const cinematic = riding();
   const phone = isPhone();
   // Layout position, not the on-screen one: the sidebar may be mid-slide.
   const left = !cinematic && !phone ? Math.max(0, sheetEl.offsetLeft + sheetEl.offsetWidth) : 0;
@@ -1631,7 +2397,7 @@ function updatePadding(immediate = false) {
 addEventListener('resize', () => updatePadding());
 
 function detailNav(starredId?: string) {
-  const label = { lines: 'Lines', following: 'Following', map: 'Map' }[tab];
+  const label = { lines: 'Lines', alerts: 'Alerts', following: 'Following', map: 'Map' }[tab];
   const on = starredId ? isFollowed(starredId) : false;
   const star = starredId
     ? `<button class="icon-btn${on ? ' starred' : ''}" data-action="star" aria-pressed="${on}" aria-label="${on ? 'Stop following' : 'Follow'}" title="${
@@ -1654,20 +2420,42 @@ function renderDetail() {
   else renderDock(selection.id);
 }
 
+function banner(a: Alert) {
+  const cause = causeLabel(a.cause);
+  const outside = EXTERNAL.has(a.cause);
+  return `<div class="banner${alertKind(a) === 'access' ? ' access' : ''}">
+    <span class="banner-icon">${ICON.alert}</span>
+    <div><strong>${escape(effectLabel(a.effect))}${cause ? ` <em class="chip${outside ? ' outside' : ''}">${escape(cause)}</em>` : ''}</strong><p>${escape(a.header)}</p></div>
+  </div>`;
+}
+
+function bunchBanner(t: Train) {
+  const b = bunches.find((x) => x.behind === t || x.ahead === t);
+  if (!b) return '';
+  const text =
+    b.behind === t
+      ? `Running ${feet(b.gap)} ft behind the train ahead. Expect it to be crowded.`
+      : `Another train is ${feet(b.gap)} ft behind this one, so the wait after them will be long.`;
+  return `<div class="banner"><span class="banner-icon">${ICON.alert}</span><div><strong>Bunched</strong><p>${text}</p></div></div>`;
+}
+
 function renderTrain(id: string) {
   const t = trains.get(id);
   if (!t) return;
   const v = t.v;
   const bus = t.route.type === 3;
-  const c = `#${t.accent.getHexString()}`;
+  const boat = t.route.type === 4;
+  const amtrak = t.route.type === AMTRAK_TYPE;
+  const c = hex(t);
   const branch = v.routeId.startsWith('Green-') ? ` · ${v.routeId.slice(-1)} branch` : '';
   const speed = mph(t);
   const next = upcoming?.[0];
   const { r, g, b } = t.accent;
   const onAccent = 0.2126 * r + 0.7152 * g + 0.0722 * b > 0.35 ? '#0a0c10' : '#ffffff';
+  const late = amtrak ? lateness(id) : null;
 
   const consistHtml = t.cars
-    .map((car, i) => `<span class="car${car === LOCOMOTIVE ? ' loco' : ''}${i === 0 ? ' lead' : ''}" style="flex:${car.length}"></span>`)
+    .map((car, i) => `<span class="car${car === LOCOMOTIVE || car === AMTRAK_LOCO || car === ACELA_POWER ? ' loco' : ''}${i === 0 ? ' lead' : ''}" style="flex:${car.length}"></span>`)
     .join('');
   let stops = '<p class="muted">Loading arrival times…</p>';
   if (upcoming && !upcoming.length) stops = '<p class="muted">No arrival times for this one right now.</p>';
@@ -1677,41 +2465,57 @@ function renderTrain(id: string) {
       .map((s) => `<li><span>${escape(s.name)}</span><time data-at="${s.at}">${countdown(s.at)}</time></li>`)
       .join('')}</ol>`;
   const statusLabel = { STOPPED_AT: 'Stopped at', INCOMING_AT: 'Arriving at', IN_TRANSIT_TO: 'Next stop' }[v.status] ?? 'Next stop';
+  const [idLabel, idValue] = amtrak
+    ? ['Train', v.label]
+    : boat
+      ? ['Vessel', titleCase(v.label)]
+      : t.route.type === 2 && v.tripName
+        ? ['Train', v.tripName]
+        : [bus ? 'Bus' : 'Car', v.label];
+  const [sizeLabel, sizeValue] = boat ? ['Type', 'Ferry'] : bus ? ['Type', 'Artic'] : ['Cars', `${t.cars.length}${t.estimated ? '*' : ''}`];
+  const notes = [bunchBanner(t), ...trainAlerts(t).slice(0, 2).map(banner)].join('');
+  const fine = [
+    `Position reported <span data-ago="${v.updatedAt}">${ago(v.updatedAt)}</span>${amtrak ? ' by Amtrak' : ''}`,
+    t.estimated
+      ? `*${amtrak ? 'Amtrak doesn’t publish its consists; a usual set is shown' : t.route.type === 2 ? 'Commuter rail doesn’t report its cars; a typical set is shown' : 'Consist not reported; typical shown'}`
+      : '',
+  ].filter(Boolean);
 
   detailEl.style.setProperty('--c', c);
   detailEl.style.setProperty('--on-c', onAccent);
   detailEl.innerHTML = `
     ${detailNav(id)}
     <div class="hero">
-      <p class="eyebrow"><span class="dot"></span>${escape(t.route.name)}${branch}</p>
+      <p class="eyebrow"><span class="dot"></span>${escape(t.route.name)}${branch}${late ? `<span class="late${late.late ? ' is-late' : ''}">${late.text}</span>` : ''}</p>
       <h2><small>To</small>${escape(destination(t))}</h2>
     </div>
+    ${notes}
     <div class="status">
       <div><small>${statusLabel}</small><strong>${escape(v.stopName ?? '—')}</strong></div>
       ${next ? `<time class="eta" data-at="${next.at}">${countdown(next.at)}</time>` : ''}
     </div>
     <dl class="metrics">
       <div><dt>Speed</dt><dd>${v.status === 'STOPPED_AT' ? '0<small>mph</small>' : speed != null ? `${speed}<small>mph</small>` : '—'}</dd></div>
-      <div><dt>${bus ? 'Type' : 'Cars'}</dt><dd>${bus ? 'Artic' : `${t.cars.length}${t.estimated ? '*' : ''}`}</dd></div>
-      <div><dt>${t.route.type === 2 && v.tripName ? 'Train' : bus ? 'Bus' : 'Car'}</dt><dd>${escape(t.route.type === 2 && v.tripName ? v.tripName : v.label)}</dd></div>
+      <div><dt>${sizeLabel}</dt><dd>${sizeValue}</dd></div>
+      <div><dt>${idLabel}</dt><dd>${escape(idValue)}</dd></div>
     </dl>
-    <div class="consist" aria-hidden="true">${consistHtml}</div>
+    ${boat ? '' : `<div class="consist" aria-hidden="true">${consistHtml}</div>`}
     <div class="actions">
       <button class="btn primary" data-action="ride">${ICON.play}Ride along</button>
-      <button class="btn" data-action="follow" aria-pressed="${cameraMode === 'follow'}">${cameraMode === 'follow' ? 'Tracking' : 'Keep in view'}</button>
+      ${flat() ? '' : `<button class="btn" data-action="cab">${ICON.cab}${boat ? 'From the bridge' : 'Cab view'}</button>`}
+      <button class="btn wide" data-action="follow" aria-pressed="${cameraMode === 'follow'}">${cameraMode === 'follow' ? 'Keeping it in view' : 'Keep in view'}</button>
     </div>
-    <h3>Upcoming</h3>
+    <h3>${amtrak ? 'Next stations' : 'Upcoming'}</h3>
     ${stops}
-    <p class="fine">Position reported <span data-ago="${v.updatedAt}">${ago(v.updatedAt)}</span>${
-      t.estimated ? ` · *${t.route.type === 2 ? 'Commuter rail doesn’t report its cars; a typical set is shown' : 'Consist not reported; typical shown'}` : ''
-    }</p>`;
+    <p class="fine">${fine.join(' · ')}</p>`;
 }
 
 function renderStation(id: string) {
   const s = stations.find((st) => st.id === id);
   if (!s || !network) return;
-  const c = s.rail ? displayColor('#80276C') : s.bus ? displayColor('#7C878E') : '#ffffff';
+  const c = s.ferry ? displayColor('#008EAA') : s.rail ? displayColor('#80276C') : s.bus ? displayColor('#7C878E') : '#ffffff';
   detailEl.style.setProperty('--c', c);
+  const mine = commute?.stationId === s.id ? commute : null;
 
   let body = '<p class="muted">Loading departures…</p>';
   if (departures) {
@@ -1731,6 +2535,7 @@ function renderStation(id: string) {
             const first = g.deps[0];
             const live = first.vehicleId && trains.has(first.vehicleId);
             const line = g.route.type === 3 ? g.route.short : g.route.name.replace(' Line', '');
+            const pinned = mine?.routeId === g.route.id && mine.headsign === g.headsign;
             return `<li style="--c:${displayColor(g.route.color)};--i:${i}">
               <button class="card" ${live ? `data-train="${escape(first.vehicleId!)}"` : 'disabled'}>
                 <span class="card-bar"></span>
@@ -1744,21 +2549,51 @@ function renderStation(id: string) {
                 }</span>
                 <span class="card-side"><time data-at="${first.at}">${countdown(first.at)}</time></span>
               </button>
+              <button class="icon-btn subtle pin${pinned ? ' on' : ''}" data-pin="${escape(`${g.route.id}|${g.headsign}`)}" aria-pressed="${pinned}" aria-label="${
+                pinned ? 'Your commute' : 'Make this my commute'
+              }" title="${pinned ? 'Your commute' : 'Make this my commute'}">${pinned ? ICON.pinOn : ICON.pin}</button>
             </li>`;
           })
           .join('')}</ul>`
       : '<p class="muted">Nothing predicted here right now.</p>';
   }
 
+  const commuteCard = mine
+    ? `<section class="commute-settings">
+        <div class="commute-head"><span>${ICON.pinOn}My commute</span><button class="link" data-commute="clear">Remove</button></div>
+        <div class="setting">
+          <span class="setting-icon">${ICON.walk}</span>
+          <span class="setting-text"><strong>Walk to the platform</strong><small>Counted when it says leave</small></span>
+          <div class="stepper">
+            <button data-commute="walk-down" aria-label="Less walking time">−</button>
+            <b>${mine.walk}<small>min</small></b>
+            <button data-commute="walk-up" aria-label="More walking time">+</button>
+          </div>
+        </div>
+        <div class="setting">
+          <span class="setting-icon">${ICON.bell}</span>
+          <span class="setting-text"><strong>Remind me to leave</strong><small>${reminderNote()}</small></span>
+          <button class="switch" role="switch" aria-checked="${mine.remind}" aria-label="Remind me to leave" data-commute="remind"></button>
+        </div>
+      </section>`
+    : '';
+  const notes = stationAlerts(s)
+    .sort((a, b) => Number(alertKind(b) === 'service') - Number(alertKind(a) === 'service'))
+    .slice(0, 3)
+    .map(banner)
+    .join('');
+
   detailEl.innerHTML = `
     ${detailNav()}
     <div class="hero">
-      <p class="eyebrow"><span class="dot"></span>${s.rail ? 'Commuter rail station' : s.bus ? 'Silver Line stop' : 'Station'}</p>
+      <p class="eyebrow"><span class="dot"></span>${s.ferry ? 'Ferry pier' : s.rail ? 'Commuter rail station' : s.bus ? 'Silver Line stop' : 'Station'}</p>
       <h2>${escape(s.name)}</h2>
     </div>
+    ${notes}
+    ${commuteCard}
     <h3>Departures</h3>
     ${body}
-    <p class="fine">Live MBTA predictions. Tap one to jump to it.</p>`;
+    <p class="fine">Live MBTA predictions. Tap one to jump to it, or the pin to make it your commute.</p>`;
 }
 
 function renderDock(id: string) {
@@ -1782,12 +2617,13 @@ function renderDock(id: string) {
 
 /** The caption bar while riding along: line, destination, next stop, speed. */
 function renderHud() {
-  const t = selection?.kind === 'train' && cameraMode === 'ride' ? trains.get(selection.id) : undefined;
+  const t = selection?.kind === 'train' && riding() ? trains.get(selection.id) : undefined;
   hudEl.hidden = !t;
   if (!t) return;
   const next = upcoming?.[0];
   const speed = mph(t);
-  hudEl.style.setProperty('--c', `#${t.accent.getHexString()}`);
+  const cab = cameraMode === 'cab';
+  hudEl.style.setProperty('--c', hex(t));
   hudEl.innerHTML = `
     <div class="hud-id">
       <span class="dot"></span>
@@ -1799,8 +2635,15 @@ function renderHud() {
       t.v.status === 'STOPPED_AT' ? '0 <em>mph</em>' : speed != null ? `${speed} <em>mph</em>` : '—'
     }</strong></div>
     <div class="hud-tools">
-      ${touring ? `<button class="hud-btn" data-action="skip">Next train <span data-tour-left></span></button>` : ''}
-      <button class="hud-btn exit" data-action="exit-ride">${ICON.close}<span>Exit</span></button>
+      ${touring ? `<button class="hud-btn" data-action="skip">Next <span data-tour-left></span></button>` : ''}
+      ${
+        flat()
+          ? ''
+          : `<button class="hud-btn" data-action="${cab ? 'ride' : 'cab'}" title="${cab ? 'Watch from behind' : 'Look out from the front'}">${
+              cab ? ICON.chase : ICON.cab
+            }<span>${cab ? 'Chase' : 'Cab'}</span></button>`
+      }
+      <button class="hud-btn exit" data-action="exit-ride" aria-label="Stop riding">${ICON.close}<span>Exit</span></button>
     </div>`;
 }
 
@@ -1817,23 +2660,30 @@ function toggleFollow(id: string) {
   renderDetail();
 }
 
-/** Fits the map to a line, leaving room for the sidebar. */
+/** Fits the map to some routes, or to their vehicles when they have no lines of their own (Amtrak). */
+function focusRoutes(routes: Route[], groupId: string) {
+  if (!network) return;
+  const bounds = new maplibregl.LngLatBounds();
+  for (const r of routes) for (const s of network.routeShapes.get(r.id) ?? []) for (const p of network.shapes.get(s) ?? []) bounds.extend(p);
+  if (bounds.isEmpty()) for (const t of trains.values()) if (routes.includes(t.route)) bounds.extend(toLngLat(t.x, t.y));
+  if (bounds.isEmpty()) return;
+  if (hidden.delete(groupId)) {
+    drawLines();
+    drawAlerts();
+    if (tab === 'lines') renderLines();
+  }
+  if (isPhone()) sheet.set('peek');
+  map.fitBounds(bounds, { padding: 48, maxZoom: 14, pitch: flat() ? 0 : 40, bearing: flat() ? 0 : map.getBearing(), duration: 1600 });
+}
+
 function focusGroup(id: string) {
   const g = GROUPS.find((x) => x.id === id);
-  if (!g || !network) return;
-  const bounds = new maplibregl.LngLatBounds();
-  for (const r of groupRoutes(g)) for (const s of network.routeShapes.get(r.id) ?? []) for (const p of network.shapes.get(s) ?? []) bounds.extend(p);
-  if (bounds.isEmpty()) return;
-  if (hidden.delete(id)) {
-    drawLines();
-    renderLines();
-  }
-  map.fitBounds(bounds, { padding: 48, pitch: flat() ? 0 : 40, bearing: flat() ? 0 : map.getBearing(), duration: 1600 });
+  if (g) focusRoutes(groupRoutes(g), g.id);
 }
 
 sheetEl.addEventListener('click', (e) => {
   const el = (e.target as HTMLElement).closest<HTMLElement>(
-    '[data-tab],[data-toggle],[data-focus],[data-layer],[data-view],[data-action],[data-train],[data-unfollow]',
+    '[data-tab],[data-toggle],[data-show-alerts],[data-focus],[data-layer],[data-view],[data-action],[data-train],[data-unfollow],[data-alert-map],[data-open-alert],[data-pin],[data-commute],[data-result]',
   );
   if (!el) return;
   const d = el.dataset;
@@ -1842,8 +2692,13 @@ sheetEl.addEventListener('click', (e) => {
     if (hidden.has(d.toggle)) hidden.delete(d.toggle);
     else hidden.add(d.toggle);
     drawLines();
+    drawAlerts();
+    findBunching();
     renderLines();
     renderStatus();
+  } else if (d.showAlerts !== undefined) {
+    e.stopPropagation();
+    setTab('alerts');
   } else if (d.focus) focusGroup(d.focus);
   else if (d.layer) {
     const key = d.layer as keyof typeof layers;
@@ -1856,23 +2711,36 @@ sheetEl.addEventListener('click', (e) => {
   else if (d.train) {
     select({ kind: 'train', id: d.train });
     setCameraMode('follow');
-  } else if (d.action === 'back') select(null);
+  } else if (d.alertMap) showAlert(d.alertMap);
+  else if (d.openAlert) {
+    openAlerts.add(d.openAlert);
+    renderMain();
+    mainEl.querySelector(`[data-alert="${CSS.escape(d.openAlert)}"]`)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  } else if (d.pin && selection?.kind === 'station') pinCommute(selection.id, d.pin);
+  else if (d.commute) changeCommute(d.commute);
+  else if (d.result) chooseResult(Number(d.result));
+  else if (d.action === 'back') select(null);
   else if (d.action === 'star' && selection?.kind === 'train') toggleFollow(selection.id);
   else if (d.action === 'ride') setCameraMode('ride');
+  else if (d.action === 'cab') setCameraMode('cab');
   else if (d.action === 'follow') setCameraMode(cameraMode === 'follow' ? 'free' : 'follow');
   else if (d.action === 'tour') setTouring(true);
+  else if (d.action === 'install') install();
 });
 
 hudEl.addEventListener('click', (e) => {
   const action = (e.target as HTMLElement).closest<HTMLElement>('[data-action]')?.dataset.action;
   if (action === 'skip') nextTourStop();
+  if (action === 'cab') setCameraMode('cab');
+  if (action === 'ride') setCameraMode('ride');
   if (action === 'exit-ride') exitRide();
 });
 
 function exitRide() {
+  const wasCab = cameraMode === 'cab';
   setTouring(false);
   setCameraMode('free');
-  map.easeTo({ pitch: flat() ? 0 : 55, zoom: Math.min(map.getZoom(), 16), duration: 1200 });
+  if (!wasCab) map.easeTo({ pitch: flat() ? 0 : 55, zoom: Math.min(map.getZoom(), 16), duration: 1200 });
 }
 
 function setViewMode(next: ViewMode) {
@@ -1881,26 +2749,358 @@ function setViewMode(next: ViewMode) {
   save(VIEW_KEY, viewMode);
   applyViewMode(true);
   if (tab === 'map') renderMain();
+  renderDetail();
+  renderHud();
 }
 
 function applyViewMode(animate: boolean) {
   if (map.getLayer('buildings-3d')) map.setLayoutProperty('buildings-3d', 'visibility', flat() ? 'none' : 'visible');
   if (flat()) {
+    if (cameraMode === 'cab') setCameraMode('ride');
     // Lock the tilt only once the camera has flattened, or it snaps.
-    map.easeTo({ pitch: 0, bearing: cameraMode === 'ride' ? map.getBearing() : 0, duration: animate ? 900 : 0 });
+    map.easeTo({ pitch: 0, bearing: riding() ? map.getBearing() : 0, duration: animate ? 900 : 0 });
     map.once('moveend', () => flat() && map.setMaxPitch(0));
   } else {
     map.setMaxPitch(78);
-    map.easeTo({ pitch: cameraMode === 'ride' ? 72 : 52, duration: animate ? 900 : 0 });
+    map.easeTo({ pitch: riding() ? 72 : 52, duration: animate ? 900 : 0 });
   }
 }
+
+// Search -------------------------------------------------------------------------
+//
+// One box for everything: stations, lines, any vehicle by number, name or
+// destination, and Bluebikes docks. "/" jumps to it; arrows and Enter pick.
+
+let results: SearchItem[] = [];
+let activeResult = 0;
+
+function searchItems(): SearchItem[] {
+  const items: SearchItem[] = [];
+  for (const g of GROUPS) {
+    const routes = groupRoutes(g);
+    items.push({
+      kind: 'line',
+      id: `group:${g.id}`,
+      title: g.label,
+      subtitle: groupSubtitle(g) || 'Line',
+      color: groupColor(g),
+      terms: [...routes.map((r) => `${r.name} ${r.short}`), { CR: 'commuter rail train', SL: 'silver bus brt', Ferry: 'boat harbor ferry', Amtrak: 'acela regional downeaster' }[g.id] ?? ''].join(' '),
+      boost: 8,
+    });
+  }
+  // Commuter rail lines, Silver Line routes and ferry routes by name too.
+  for (const r of network?.routes.values() ?? []) {
+    if (r.type < 2 || r.type === AMTRAK_TYPE) continue;
+    items.push({
+      kind: 'line',
+      id: `route:${r.id}`,
+      title: r.name,
+      subtitle: r.type === 2 ? 'Commuter Rail' : r.type === 3 ? 'Silver Line' : 'Ferry',
+      color: displayColor(r.color),
+      terms: `${r.short} ${r.destinations.join(' ')}`,
+      boost: 6,
+    });
+  }
+  for (const s of stations) {
+    items.push({
+      kind: 'station',
+      id: s.id,
+      title: s.name,
+      subtitle: s.ferry ? 'Ferry pier' : s.rail ? 'Commuter rail station' : s.bus ? 'Silver Line stop' : 'Station',
+      color: s.ferry ? displayColor('#008EAA') : s.rail ? displayColor('#80276C') : s.bus ? displayColor('#7C878E') : '#ffffff',
+      terms: s.ferry ? 'pier wharf ferry' : '',
+      boost: s.rail || s.bus || s.ferry ? 5 : 6,
+    });
+  }
+  for (const t of trains.values()) {
+    items.push({
+      kind: 'vehicle',
+      id: t.v.id,
+      title: vehicleLabel(t),
+      subtitle: `${t.route.name} · to ${destination(t)}`,
+      color: hex(t),
+      terms: `${t.v.label} ${t.v.tripName ?? ''} ${destination(t)} ${t.route.short} ${t.route.name}`,
+      boost: 0,
+    });
+  }
+  for (const d of docks) {
+    items.push({ kind: 'dock', id: d.id, title: d.name, subtitle: `Bluebikes · ${d.bikes + d.ebikes} bikes`, color: '#38bdf8', terms: 'bluebikes bike dock', boost: -1 });
+  }
+  return items;
+}
+
+const KIND_LABEL = { line: 'Line', station: 'Station', vehicle: 'Live', dock: 'Bikes' };
+
+function renderSearch() {
+  const q = searchEl.value.trim();
+  sheetEl.classList.toggle('searching', !!q);
+  if (!q) {
+    searchView.innerHTML = '';
+    return;
+  }
+  results = search(searchItems(), q);
+  activeResult = Math.min(activeResult, Math.max(0, results.length - 1));
+  searchView.innerHTML = results.length
+    ? `<ul class="results" role="listbox" aria-label="Results">${results
+        .map(
+          (r, i) => `<li><button class="result${i === activeResult ? ' active' : ''}" role="option" aria-selected="${i === activeResult}" data-result="${i}" style="--c:${r.color}">
+            <span class="result-icon ${r.kind}">${r.kind === 'vehicle' ? ICON.train : r.kind === 'dock' ? ICON.bike : r.kind === 'station' ? ICON.station : ''}</span>
+            <span class="result-text"><strong>${escape(r.title)}</strong><small>${escape(r.subtitle)}</small></span>
+            <span class="result-kind">${r.kind === 'vehicle' && isAmtrak(r.id) ? 'Amtrak' : KIND_LABEL[r.kind]}</span>
+          </button></li>`,
+        )
+        .join('')}</ul>`
+    : `<div class="empty small"><strong>Nothing called “${escape(q)}”</strong><p>Try a station, a line, a train number like 508, or a ferry’s name.</p></div>`;
+}
+
+function closeSearch() {
+  if (!searchEl.value && !sheetEl.classList.contains('searching')) return;
+  searchEl.value = '';
+  activeResult = 0;
+  renderSearch();
+}
+
+function chooseResult(i: number) {
+  const r = results[i];
+  if (!r) return;
+  closeSearch();
+  searchEl.blur();
+  if (r.kind === 'line') {
+    const [kind, id] = r.id.split(/:(.*)/);
+    if (kind === 'group') focusGroup(id);
+    else {
+      const route = network?.routes.get(id);
+      if (route) focusRoutes([route], groupOf(route));
+    }
+  } else if (r.kind === 'station') select({ kind: 'station', id: r.id });
+  else if (r.kind === 'vehicle' && trains.has(r.id)) {
+    select({ kind: 'train', id: r.id });
+    setCameraMode('follow');
+  } else if (r.kind === 'dock') {
+    if (!layers.bikes) {
+      layers.bikes = true;
+      save(LAYERS_KEY, layers);
+      applyLayerToggles();
+    }
+    select({ kind: 'dock', id: r.id });
+  }
+}
+
+searchEl.addEventListener('input', () => {
+  activeResult = 0;
+  if (selection && searchEl.value) select(null);
+  renderSearch();
+});
+searchEl.addEventListener('focus', () => {
+  // Make room above the keyboard for results.
+  if (isPhone()) sheet.set('full');
+  // Docks are searchable too; load them the first time someone looks.
+  if (!docks.length) loadDocks().then((d) => (docks = d), console.warn);
+});
+searchEl.addEventListener('keydown', (e) => {
+  if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+    e.preventDefault();
+    if (!results.length) return;
+    activeResult = (activeResult + (e.key === 'ArrowDown' ? 1 : -1) + results.length) % results.length;
+    renderSearch();
+    searchView.querySelector('.result.active')?.scrollIntoView({ block: 'nearest' });
+  } else if (e.key === 'Enter') {
+    e.preventDefault();
+    chooseResult(activeResult);
+  } else if (e.key === 'Escape') {
+    e.stopPropagation();
+    closeSearch();
+    searchEl.blur();
+  }
+});
+$('.search').addEventListener('click', () => searchEl.focus());
+
+// My commute -----------------------------------------------------------------------
+//
+// One trip you take often, pinned from a station's departures. The header
+// counts down to when you need to leave to make the next one you can catch,
+// and, while the app is open, a notification says when to go.
+
+interface Commute {
+  stationId: string;
+  stationName: string;
+  routeId: string;
+  headsign: string;
+  /** Minutes on foot to the platform. */
+  walk: number;
+  remind: boolean;
+}
+const COMMUTE_KEY = 'live-boston:commute';
+let commute: Commute | null = load<Commute | null>(COMMUTE_KEY, null);
+let commuteDeps: Departure[] | null = null;
+let remindedAt = 0;
+
+async function refreshCommute() {
+  if (!commute || document.hidden || Date.now() < pausedUntil) return;
+  // The open station panel fetches the same thing; let it.
+  if (selection?.kind === 'station' && selection.id === commute.stationId) return;
+  try {
+    setCommuteDepartures(await loadDepartures(commute.stationId));
+  } catch (err) {
+    if (err instanceof RateLimited) handleError(err, '');
+    else console.warn(err);
+  }
+}
+
+function setCommuteDepartures(deps: Departure[]) {
+  if (!commute) return;
+  const c = commute;
+  commuteDeps = deps.filter((d) => d.routeId === c.routeId && d.headsign === c.headsign);
+  renderCommute();
+}
+
+/** The next departure you can still make on foot, and when to set off. */
+function commutePlan() {
+  if (!commute || !commuteDeps) return null;
+  const walk = commute.walk * 60_000;
+  const now = Date.now();
+  const next = commuteDeps.find((d) => d.at - now >= walk - 30_000);
+  if (!next) return null;
+  return { next, leave: next.at - walk, after: commuteDeps.filter((d) => d.at > next.at).slice(0, 2) };
+}
+
+let commuteHtml = '';
+function renderCommute() {
+  commuteEl.hidden = !commute;
+  sheetEl.classList.toggle('has-commute', !!commute);
+  if (!commute) return;
+  const route = network?.routes.get(commute.routeId);
+  const line = route ? (route.type === 3 ? route.short : route.name.replace(' Line', '')) : '';
+  const plan = commutePlan();
+  let side = '<small>Leave in</small><b>…</b>';
+  let state = '';
+  if (commuteDeps && !plan) side = '<small>No more</small><b>—</b>';
+  else if (plan) {
+    const leaveIn = plan.leave - Date.now();
+    if (leaveIn <= 60_000) {
+      side = '<small>Leave</small><b>now</b>';
+      state = ' go';
+    } else {
+      const m = Math.round(leaveIn / 60_000);
+      side = `<small>Leave in</small><b>${leaveIn >= 3_600_000 ? clockFmt.format(plan.leave) : `${m}<i>min</i>`}</b>`;
+      state = m <= 5 ? ' soon' : '';
+    }
+  }
+  const html = `<span class="card-bar"></span>
+    <span class="commute-text">
+      <small>${ICON.pinOn}${escape(line)} · ${escape(commute.stationName)}</small>
+      <strong>To ${escape(commute.headsign)}</strong>
+      <span>${plan ? `Departs ${clockFmt.format(plan.next.at)}${plan.after.length ? ` · then ${plan.after.map((d) => clockFmt.format(d.at)).join(', ')}` : ''}` : commuteDeps ? 'Nothing predicted right now' : 'Checking times…'}</span>
+    </span>
+    <span class="commute-side${state}">${side}</span>`;
+  // Redrawn every second for the countdown; skip the DOM when nothing changed.
+  if (html !== commuteHtml) {
+    commuteHtml = html;
+    commuteEl.innerHTML = html;
+    commuteEl.style.setProperty('--c', route ? displayColor(route.color) : '#777');
+  }
+}
+
+function pinCommute(stationId: string, key: string) {
+  const s = stations.find((x) => x.id === stationId);
+  const [routeId, headsign] = key.split(/\|(.*)/);
+  if (!s || !routeId) return;
+  const same = commute?.stationId === stationId && commute.routeId === routeId && commute.headsign === headsign;
+  if (same) {
+    changeCommute('clear');
+    return;
+  }
+  commute = { stationId, stationName: s.name, routeId, headsign, walk: commute?.walk ?? 5, remind: commute?.remind ?? false };
+  save(COMMUTE_KEY, commute);
+  commuteDeps = null;
+  if (departures) setCommuteDepartures(departures);
+  const route = network?.routes.get(routeId);
+  toast('Pinned as your commute', `${route?.name ?? ''} to ${headsign} from ${s.name}. It counts down up top.`);
+  renderCommute();
+  renderDetail();
+  sheet.set(sheet.snap, false);
+}
+
+async function changeCommute(action: string) {
+  if (!commute) return;
+  if (action === 'clear') {
+    commute = null;
+    commuteDeps = null;
+    save(COMMUTE_KEY, null);
+  } else if (action === 'walk-up' || action === 'walk-down') {
+    commute.walk = Math.max(0, Math.min(45, commute.walk + (action === 'walk-up' ? 1 : -1)));
+  } else if (action === 'remind') {
+    commute.remind = !commute.remind;
+    if (commute.remind && 'Notification' in window && Notification.permission === 'default') {
+      await Notification.requestPermission();
+    }
+  }
+  if (commute) save(COMMUTE_KEY, commute);
+  renderCommute();
+  renderDetail();
+  sheet.set(sheet.snap, false);
+}
+
+function reminderNote() {
+  if (!('Notification' in window)) return 'A banner here when it’s time to go, while the app is open';
+  if (Notification.permission === 'denied') return 'Notifications are blocked; you’ll get a banner here instead';
+  return 'A notification when it’s time to go, while the app is open';
+}
+
+function remindIfTime() {
+  if (!commute?.remind) return;
+  const plan = commutePlan();
+  if (!plan) return;
+  const leaveIn = plan.leave - Date.now();
+  // Once per departure: a fresh reminder only after a few quiet minutes.
+  if (leaveIn > 60_000 || leaveIn < -90_000 || Date.now() - remindedAt < 5 * 60_000) return;
+  remindedAt = Date.now();
+  const route = network?.routes.get(commute.routeId);
+  const title = `Time to leave for ${commute.stationName}`;
+  const body = `${route?.name ?? 'Your train'} to ${commute.headsign} departs at ${clockFmt.format(plan.next.at)}. ${commute.walk} min walk.`;
+  toast(title, body, true);
+  notify(title, body);
+}
+
+async function notify(title: string, body: string) {
+  if (!('Notification' in window) || Notification.permission !== 'granted') return;
+  const options = { body, icon: `${import.meta.env.BASE_URL}icons/icon-192.png`, tag: 'commute' };
+  try {
+    // Android only shows notifications through the service worker.
+    const reg = await navigator.serviceWorker?.getRegistration();
+    if (reg) await reg.showNotification(title, options);
+    else new Notification(title, options);
+  } catch (err) {
+    console.warn(err);
+  }
+}
+
+commuteEl.addEventListener('click', () => {
+  if (!commute) return;
+  closeSearch();
+  select({ kind: 'station', id: commute.stationId });
+});
+
+let toastTimer: number | undefined;
+function toast(title: string, body: string, urgent = false) {
+  toastEl.innerHTML = `<strong>${escape(title)}</strong><span>${escape(body)}</span>`;
+  toastEl.classList.toggle('urgent', urgent);
+  toastEl.hidden = false;
+  toastEl.classList.remove('out');
+  clearTimeout(toastTimer);
+  toastTimer = window.setTimeout(() => toastEl.classList.add('out'), urgent ? 12_000 : 5000);
+}
+toastEl.addEventListener('click', () => toastEl.classList.add('out'));
+toastEl.addEventListener('animationend', (e) => {
+  if ((e as AnimationEvent).animationName.startsWith('toast-out')) toastEl.hidden = true;
+});
 
 // Map controls
 $('#zoom-in').addEventListener('click', () => map.zoomIn());
 $('#zoom-out').addEventListener('click', () => map.zoomOut());
 $('#compass').addEventListener('click', () => {
   // Riding along, "north" means back to looking ahead of the train.
-  if (cameraMode === 'ride') rideLook = 0;
+  if (riding()) rideLook = 0;
   else map.easeTo({ bearing: 0, pitch: flat() ? 0 : map.getPitch(), duration: 700 });
 });
 $('#overview').addEventListener('click', () => {
@@ -1910,8 +3110,15 @@ $('#overview').addEventListener('click', () => {
 });
 
 document.addEventListener('keydown', (e) => {
+  const typing = e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement;
+  if (e.key === '/' && !typing && !e.metaKey && !e.ctrlKey) {
+    e.preventDefault();
+    if (riding()) exitRide();
+    searchEl.focus();
+    return;
+  }
   if (e.key !== 'Escape') return;
-  if (cameraMode === 'ride') exitRide();
+  if (riding()) exitRide();
   else select(null);
 });
 
@@ -1962,11 +3169,25 @@ map.on('load', async () => {
       await new Promise((r) => setTimeout(r, Math.max(1000, wait)));
     }
   }
+  mbtaRouteIds = [...network.routes.keys()];
+  for (const s of stations) for (const id of [s.id, ...s.children]) stationByStop.set(id, s);
   drawLines();
   drawStations();
   renderMain();
+  renderCommute();
   await poll();
   setInterval(poll, POLL_MS);
+  pollAmtrak();
+  setInterval(pollAmtrak, AMTRAK_MS);
+  // Spread the rest out: the MBTA allows 20 requests a minute without a key.
+  setTimeout(() => {
+    refreshAlerts();
+    setInterval(refreshAlerts, ALERTS_MS);
+  }, 2500);
+  setTimeout(() => {
+    refreshCommute();
+    setInterval(refreshCommute, COMMUTE_MS);
+  }, 5000);
 
   openFromHash();
   if (!deepLink) setTimeout(showSpinTip, 6500);
@@ -1976,6 +3197,7 @@ map.on('load', async () => {
 
 /** Phones and tablets: a touchscreen is the main way in. */
 const touchFirst = matchMedia('(pointer: coarse)').matches;
+if (touchFirst) $('.search kbd').hidden = true;
 
 /** A one-time hint on how to spin the city, shown after the intro. */
 function showSpinTip() {
@@ -2001,21 +3223,27 @@ function openFromHash() {
   const stationId = hash.get('station');
   if (trainId && trains.has(trainId)) {
     select({ kind: 'train', id: trainId });
-    setCameraMode('ride');
+    setCameraMode(hash.has('cab') && !flat() ? 'cab' : 'ride');
   } else if (stationId && stations.some((s) => s.id === stationId)) {
     select({ kind: 'station', id: stationId });
   } else if (hash.has('following')) {
     setTab('following');
+  } else if (hash.has('alerts')) {
+    setTab('alerts');
   }
 }
 
+registerServiceWorker();
 renderMain(true);
+renderCommute();
 setInterval(tick, 1000);
 tick();
 
 document.addEventListener('visibilitychange', () => {
   if (!document.hidden) catchUp();
-  if (!document.hidden && Date.now() - lastUpdate > POLL_MS) poll();
+  if (document.hidden) return;
+  if (Date.now() - lastUpdate > POLL_MS) poll();
+  refreshCommute();
 });
 
 /** Puts every train straight at its estimate, after time the page didn't see. */

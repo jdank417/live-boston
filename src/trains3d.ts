@@ -20,6 +20,8 @@ export interface Car {
   followed: boolean;
   /** Side-to-side lean in radians, for a little sway at speed. */
   roll: number;
+  /** Draw a ferry instead of a rail car. */
+  boat?: boolean;
 }
 
 /** Sun and sky, from the real time of day (see sky.ts). */
@@ -53,6 +55,25 @@ function unitParts() {
   // A soft shadow pooled under the car, a little longer and wider than it.
   const shadow = new THREE.PlaneGeometry(1.25, 2.2).translate(0, 0, 0.003);
   return { body, roof, stripe, windows, bogies, shadow };
+}
+
+/** A harbor ferry in the same unit space: a hull pointed at the bow (+x), a cabin and a bridge. */
+function boatParts() {
+  const outline = new THREE.Shape();
+  outline.moveTo(-0.5, -0.42);
+  outline.lineTo(0.22, -0.5);
+  outline.quadraticCurveTo(0.44, -0.42, 0.5, 0);
+  outline.quadraticCurveTo(0.44, 0.42, 0.22, 0.5);
+  outline.lineTo(-0.5, 0.42);
+  outline.closePath();
+  const hull = new THREE.ExtrudeGeometry(outline, { depth: 0.4, bevelEnabled: false, curveSegments: 8 });
+  const cabin = mergeGeometries([
+    new THREE.BoxGeometry(0.52, 0.74, 0.32).translate(-0.08, 0, 0.56),
+    new THREE.BoxGeometry(0.18, 0.5, 0.14).translate(0.06, 0, 0.79),
+  ]);
+  const windows = new THREE.BoxGeometry(0.53, 0.752, 0.12).translate(-0.08, 0, 0.6);
+  const roof = new THREE.BoxGeometry(0.52, 0.74, 0.03).translate(-0.08, 0, 0.735);
+  return { hull, cabin, windows, roof };
 }
 
 /** Side windows and doors for one car, lit from inside. */
@@ -150,6 +171,10 @@ export class TrainLayer implements CustomLayerInterface {
   /** Faint line-colored silhouettes of whatever buildings hide. */
   private readonly xray;
   private readonly windowMaterial;
+  private readonly hull;
+  private readonly cabin;
+  private readonly boatWindows;
+  private readonly boatRoof;
   private readonly hemi;
   private readonly sun;
 
@@ -191,7 +216,25 @@ export class TrainLayer implements CustomLayerInterface {
     this.xray.count = 0;
     this.xray.renderOrder = 1;
 
-    this.scene.add(this.shadow, this.bogies, this.body, this.roof, this.stripe, this.windows, this.xray);
+    const b = boatParts();
+    this.hull = instanced(b.hull, new THREE.MeshLambertMaterial());
+    this.cabin = instanced(b.cabin, new THREE.MeshLambertMaterial({ color: '#eef1f4' }));
+    this.boatWindows = instanced(b.windows, this.windowMaterial);
+    this.boatRoof = instanced(b.roof, new THREE.MeshLambertMaterial());
+
+    this.scene.add(
+      this.shadow,
+      this.bogies,
+      this.body,
+      this.roof,
+      this.stripe,
+      this.windows,
+      this.xray,
+      this.hull,
+      this.cabin,
+      this.boatWindows,
+      this.boatRoof,
+    );
 
     // The camera has no transform, so the lights live in local meters too.
     this.hemi = new THREE.HemisphereLight('#e4ecff', '#30384a', 2.6);
@@ -220,31 +263,50 @@ export class TrainLayer implements CustomLayerInterface {
     const pos = new THREE.Vector3();
     const scale = new THREE.Vector3();
     const under = new THREE.Color();
-    const n = Math.min(cars.length, MAX_CARS);
+    const rail = [this.body, this.roof, this.stripe, this.windows, this.bogies];
+    const boat = [this.hull, this.cabin, this.boatWindows, this.boatRoof];
+    let n = 0;
+    let nb = 0;
+    let ns = 0;
 
-    for (let i = 0; i < n; i++) {
-      const c = cars[i];
+    for (const c of cars) {
+      if (n >= MAX_CARS || nb >= MAX_CARS) break;
       // Heading, then a lean about the car's own length.
       q.setFromEuler(euler.set(c.roll, 0, c.angle));
       pos.set(c.x, c.y, 0);
       scale.set(c.length, c.width, c.height);
       m.compose(pos, q, scale);
-      for (const mesh of [this.body, this.roof, this.stripe, this.windows, this.bogies, this.shadow]) {
-        mesh.setMatrixAt(i, m);
+      if (c.boat) {
+        for (const mesh of boat) mesh.setMatrixAt(nb, m);
+        this.hull.setColorAt(nb, c.body);
+        this.cabin.setColorAt(nb, WHITE);
+        this.boatWindows.setColorAt(nb, WHITE);
+        this.boatRoof.setColorAt(nb, c.accent);
+        nb++;
+      } else {
+        for (const mesh of rail) mesh.setMatrixAt(n, m);
+        this.body.setColorAt(n, c.body);
+        this.roof.setColorAt(n, c.accent);
+        this.stripe.setColorAt(n, c.accent);
+        this.windows.setColorAt(n, WHITE);
+        this.bogies.setColorAt(n, WHITE);
+        n++;
       }
-      this.body.setColorAt(i, c.body);
-      this.roof.setColorAt(i, c.accent);
-      this.stripe.setColorAt(i, c.accent);
-      this.windows.setColorAt(i, WHITE);
-      this.bogies.setColorAt(i, WHITE);
       // The pool under a car is its shadow, or a glow when it's picked out.
-      this.shadow.setColorAt(i, c.selected ? under.copy(c.accent) : c.followed ? GOLD : SHADOW);
+      this.shadow.setMatrixAt(ns, m);
+      this.shadow.setColorAt(ns++, c.selected ? under.copy(c.accent) : c.followed ? GOLD : SHADOW);
     }
 
-    for (const mesh of [this.body, this.roof, this.stripe, this.windows, this.bogies, this.shadow]) {
-      mesh.count = n;
-      mesh.instanceMatrix.needsUpdate = true;
-      mesh.instanceColor!.needsUpdate = true;
+    for (const [meshes, count] of [
+      [rail, n],
+      [boat, nb],
+      [[this.shadow], ns],
+    ] as const) {
+      for (const mesh of meshes) {
+        mesh.count = count;
+        mesh.instanceMatrix.needsUpdate = true;
+        mesh.instanceColor!.needsUpdate = true;
+      }
     }
     this.xray.count = n;
   }

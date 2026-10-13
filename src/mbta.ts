@@ -8,8 +8,8 @@
 const BASE = 'https://api-v3.mbta.com';
 const KEY = import.meta.env.VITE_MBTA_API_KEY as string | undefined;
 
-/** 0 light rail (Green, Mattapan), 1 heavy rail (Red, Orange, Blue), 2 commuter rail. */
-export const ROUTE_TYPES = '0,1,2';
+/** 0 light rail (Green, Mattapan), 1 heavy rail (Red, Orange, Blue), 2 commuter rail, 4 ferry. */
+export const ROUTE_TYPES = '0,1,2,4';
 /** The Silver Line: bus rapid transit, so route type 3, picked out by route. */
 export const SILVER_LINE = ['741', '742', '743', '751', '749', '746'];
 
@@ -62,7 +62,7 @@ function time(s: string | null | undefined) {
 export interface Route {
   id: string;
   name: string;
-  /** 0 light rail, 1 heavy rail, 2 commuter rail, 3 bus (Silver Line). */
+  /** 0 light rail, 1 heavy rail, 2 commuter rail, 3 bus (Silver Line), 4 ferry; 99 for Amtrak (not MBTA). */
   type: number;
   /** Short name, e.g. "SL1". */
   short: string;
@@ -140,9 +140,13 @@ export interface Station {
   rail: boolean;
   /** A Silver Line stop that's not also a subway or rail station. */
   bus: boolean;
+  /** A ferry pier. */
+  ferry: boolean;
+  /** Its platforms' stop ids; alerts often name a platform, not the station. */
+  children: string[];
 }
 
-async function stationsOf(filter: Record<string, string>, rail: boolean, bus = false): Promise<Station[]> {
+async function stationsOf(filter: Record<string, string>, rail: boolean, bus = false, ferry = false): Promise<Station[]> {
   // Filtering by route type returns platforms; their parents are the stations.
   const doc = await get('/stops', {
     ...filter,
@@ -153,29 +157,39 @@ async function stationsOf(filter: Record<string, string>, rail: boolean, bus = f
   const stations = new Map<string, Station>();
   for (const platform of doc.data) {
     const s = parents.get(rel(platform, 'parent_station') ?? '') ?? platform;
-    stations.set(s.id, {
+    const station: Station = stations.get(s.id) ?? {
       id: s.id,
       name: s.attributes.name,
       lng: s.attributes.longitude,
       lat: s.attributes.latitude,
       rail,
       bus,
-    });
+      ferry,
+      children: [],
+    };
+    if (platform.id !== s.id) station.children.push(platform.id);
+    stations.set(s.id, station);
   }
   return [...stations.values()];
 }
 
 export async function loadStations(): Promise<Station[]> {
-  const [subway, rail, silver] = await Promise.all([
+  const [subway, rail, silver, piers] = await Promise.all([
     stationsOf({ 'filter[route_type]': '0,1' }, false),
     stationsOf({ 'filter[route_type]': '2' }, true),
     stationsOf({ 'filter[route]': SILVER_LINE.join(',') }, false, true),
+    stationsOf({ 'filter[route_type]': '4' }, false, false, true),
   ]);
   // Stations served by several (South Station, Back Bay, …) count as subway.
   const out: Station[] = [];
   const ids = new Set<string>();
-  for (const s of [...subway, ...rail, ...silver]) {
-    if (ids.has(s.id)) continue;
+  for (const s of [...subway, ...rail, ...silver, ...piers]) {
+    const seen = out.find((o) => o.id === s.id);
+    if (seen) {
+      // A station on several modes: keep every platform.
+      for (const c of s.children) if (!seen.children.includes(c)) seen.children.push(c);
+      continue;
+    }
     ids.add(s.id);
     out.push(s);
   }
@@ -234,7 +248,8 @@ export async function loadVehicles(routeIds: string[]): Promise<Vehicle[]> {
       const stop = stops.get(rel(v, 'stop') ?? '');
       return {
         id: v.id,
-        label: a.label,
+        // Ferries have no label; their id is the vessel's name.
+        label: a.label ?? v.id,
         routeId: rel(v, 'route')!,
         tripId,
         tripName: trip?.attributes.name || undefined,
@@ -339,4 +354,54 @@ export function decodePolyline(encoded: string): [number, number][] {
     out.push([lng / 1e5, lat / 1e5]);
   }
   return out;
+}
+
+// ---------------------------------------------------------------------------
+// Service alerts
+
+export interface Alert {
+  id: string;
+  /** e.g. DELAY, SUSPENSION, SHUTTLE, STATION_CLOSURE, ELEVATOR_CLOSURE. */
+  effect: string;
+  /** e.g. FREIGHT_TRAIN_INTERFERENCE, DRAWBRIDGE_BEING_RAISED, ROUGH_SEAS. */
+  cause: string;
+  /** 0–10, the MBTA's own scale. */
+  severity: number;
+  header: string;
+  /** A short summary, e.g. "Delays on Red Line". */
+  summary: string;
+  description: string;
+  url: string | null;
+  routes: string[];
+  stops: string[];
+  trips: string[];
+  updatedAt: number;
+}
+
+/** Alerts in effect right now on these routes. */
+export async function loadAlerts(routeIds: string[]): Promise<Alert[]> {
+  const doc = await get('/alerts', {
+    'filter[route]': routeIds.join(','),
+    'filter[datetime]': 'NOW',
+    'fields[alert]': 'effect,cause,severity,header,service_effect,short_header,description,url,informed_entity,updated_at',
+  });
+  return doc.data.map((a) => {
+    const x = a.attributes;
+    const entities: { route?: string; stop?: string; trip?: string }[] = x.informed_entity ?? [];
+    const uniq = (k: 'route' | 'stop' | 'trip') => [...new Set(entities.map((e) => e[k]).filter((v): v is string => !!v))];
+    return {
+      id: a.id,
+      effect: x.effect,
+      cause: x.cause,
+      severity: x.severity ?? 0,
+      header: x.header ?? '',
+      summary: x.service_effect || x.short_header || x.header || '',
+      description: x.description ?? '',
+      url: x.url ?? null,
+      routes: uniq('route'),
+      stops: uniq('stop'),
+      trips: uniq('trip'),
+      updatedAt: time(x.updated_at),
+    };
+  });
 }
