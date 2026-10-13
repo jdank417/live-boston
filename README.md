@@ -1,21 +1,40 @@
 # Live Boston
 
-Boston in real time: every T train moving on a 3D map of the city.
+Boston in real time: every T and commuter rail train, drawn in 3D on a live map of the city.
 
 **[jdank417.github.io/live-boston](https://jdank417.github.io/live-boston/)**
 
-- Every Red, Orange, Blue, Green and Mattapan train, gliding between live position updates
-- Click a train to see where it's headed and when it reaches its next stops
-- **Follow this train** flies into a tilted 3D view and keeps the camera on it
-- Toggle lines on and off from the legend
-- Link straight to a train with `#train=<vehicle id>`
+- Every Red, Orange, Blue, Green, Mattapan and commuter rail train as a real 3D
+  train: the actual number of cars it's running (as the MBTA reports it), true
+  car dimensions, lit windows, headlights and taillights
+- Each car follows the curves of its own track, and trains hidden by buildings
+  or underground stations show through as a faint outline
+- **Ride along** puts the camera behind a train and turns with the track;
+  **Tour** hops between trains on its own
+- Tap a train for its next stops and speed, or a station for its live departure board
+- Link straight to a train (`#train=<vehicle id>`) or a station (`#station=place-pktrm`)
+
+## How accurate is it?
+
+Every position report is snapped onto the exact route shape that train's trip
+runs on, and the train then glides *along the track* to its next report rather
+than cutting across. In testing, reports sat a median of 3.5 m from their
+track, 57 of 58 moving trains faced the same way as the MBTA's own bearing,
+and small backward jitters are held rather than shown. Positions are as fresh
+as the MBTA's own reports, usually under 30 seconds old; the panel shows each
+train's age.
+
+Commuter rail doesn't report its consist, so those trains are drawn as a
+typical locomotive and six coaches, and the panel says so.
 
 ## How it works
 
 It's a static site with no backend. The browser pulls live data straight from
-the [MBTA V3 API](https://api-v3.mbta.com) every 12 seconds and draws it with
+the [MBTA V3 API](https://api-v3.mbta.com) every 12 seconds. The map is
 [MapLibre GL](https://maplibre.org) on [OpenFreeMap](https://openfreemap.org)
-tiles, with buildings extruded from OpenStreetMap heights.
+tiles with buildings extruded from OpenStreetMap heights, and the trains are
+drawn with [three.js](https://threejs.org) in a custom layer that shares the
+map's depth buffer.
 
 Without an API key the MBTA allows 20 requests a minute per visitor, which is
 plenty. To use a key, set `VITE_MBTA_API_KEY` at build time (the deploy
@@ -33,7 +52,6 @@ Pushes to `main` build and deploy to GitHub Pages through
 
 ## Roadmap
 
-- Buses and commuter rail
 - Bluebikes stations with live bike and dock counts
-- Planes in and out of Logan
+- Buses
 - Pin a station for a live countdown

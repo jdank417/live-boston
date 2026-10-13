@@ -2,21 +2,44 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="description" content="Boston in real time: every T train moving on a live 3D map of the city." />
-    <meta name="theme-color" content="#0d1117" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="description" content="Boston in real time: every T and commuter rail train, in 3D, on a live map of the city." />
+    <meta name="theme-color" content="#090c13" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500;600&family=Space+Grotesk:wght@600;700&display=swap"
+      rel="stylesheet"
+    />
     <title>Live Boston</title>
   </head>
   <body>
     <div id="map"></div>
+    <div class="vignette" aria-hidden="true"></div>
 
-    <aside id="hud">
-      <h1>Live Boston</h1>
-      <p id="status" role="status">Connecting…</p>
-      <div id="legend" aria-label="Lines"></div>
-    </aside>
+    <header id="brand">
+      <div class="title"><span class="live" aria-hidden="true"></span>Live Boston</div>
+      <div id="clock" aria-label="Boston time"></div>
+      <p id="summary" role="status"></p>
+      <div class="controls">
+        <button id="tour" aria-pressed="false" title="Ride random trains around the city">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 2.5v11l9-5.5z" fill="currentColor" /></svg>
+          <span class="label">Tour</span>
+        </button>
+        <button id="overview" title="Back to the whole map">
+          <svg viewBox="0 0 16 16" aria-hidden="true">
+            <path d="M8 2 2 7h1.5v6h3.5V9.5h2V13h3.5V7H14z" fill="currentColor" />
+          </svg>
+          <span class="label">Overview</span>
+        </button>
+      </div>
+    </header>
+
+    <p id="notice" role="alert" hidden></p>
 
     <section id="panel" hidden aria-live="polite"></section>
+
+    <nav id="dock" aria-label="Lines"></nav>
 
     <script type="module" src="/src/main.ts"></script>
   </body>
