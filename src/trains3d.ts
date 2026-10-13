@@ -21,6 +21,29 @@ export interface Car {
   selected: boolean;
   /** On your Following list: glows gold. */
   followed: boolean;
+  /** Side-to-side lean in radians, for a little sway at speed. */
+  roll: number;
+}
+
+/** A soft patch of light on the ground: trail behind a train, or a headlight beam ahead. */
+export interface Glow {
+  x: number;
+  y: number;
+  angle: number;
+  length: number;
+  width: number;
+  /** Already scaled by brightness; the blend is additive, so darker is fainter. */
+  color: THREE.Color;
+}
+
+/** Sun and sky, from the real time of day (see sky.ts). */
+export interface Lighting {
+  /** Unit vector toward the sun, local x east, y north, z up. */
+  sun: [number, number, number];
+  sunIntensity: number;
+  skyIntensity: number;
+  /** 0 by day, 1 at night: lit windows and headlight beams come up with it. */
+  night: number;
 }
 
 const MAX_CARS = 3000;
@@ -47,7 +70,9 @@ function unitParts() {
     new THREE.BoxGeometry(0.012, 0.16, 0.07).translate(0.497, -0.3, 0.3),
   ]);
   const glow = new THREE.PlaneGeometry(1.6, 5).translate(0, 0, 0.004);
-  return { body, roof, stripe, windows, bogies, lamps, glow };
+  // Trails and beams are sized per instance in meters, not by the car.
+  const patch = new THREE.PlaneGeometry(1, 1).translate(0, 0, 0.05);
+  return { body, roof, stripe, windows, bogies, lamps, glow, patch };
 }
 
 /** Side windows and doors for one car, lit from inside. */
@@ -88,6 +113,30 @@ function windowTexture() {
   tex.colorSpace = THREE.SRGBColorSpace;
   tex.anisotropy = 4;
   return tex;
+}
+
+/** Bright at the near end, fading out along the beam. */
+function beamTexture() {
+  const w = 256;
+  const h = 64;
+  const ctx = document.createElement('canvas').getContext('2d')!;
+  ctx.canvas.width = w;
+  ctx.canvas.height = h;
+  const along = ctx.createLinearGradient(0, 0, w, 0);
+  along.addColorStop(0, 'rgba(255,255,255,0)');
+  along.addColorStop(0.08, 'rgba(255,255,255,0.9)');
+  along.addColorStop(1, 'rgba(255,255,255,0)');
+  ctx.fillStyle = along;
+  ctx.fillRect(0, 0, w, h);
+  // Soften the sides.
+  ctx.globalCompositeOperation = 'destination-in';
+  const across = ctx.createLinearGradient(0, 0, 0, h);
+  across.addColorStop(0, 'rgba(0,0,0,0)');
+  across.addColorStop(0.5, 'rgba(0,0,0,1)');
+  across.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = across;
+  ctx.fillRect(0, 0, w, h);
+  return new THREE.CanvasTexture(ctx.canvas);
 }
 
 function glowTexture() {
@@ -139,6 +188,11 @@ export class TrainLayer implements CustomLayerInterface {
   private readonly headlights;
   private readonly taillights;
   private readonly glow;
+  private readonly trail;
+  private readonly beams;
+  private readonly windowMaterial;
+  private readonly hemi;
+  private readonly sun;
   /** Line-colored silhouettes of whatever buildings hide (underground stations, downtown). */
   private readonly xray;
 
@@ -149,10 +203,13 @@ export class TrainLayer implements CustomLayerInterface {
     // Unlit, so the line color reads as a lit livery band at night.
     this.stripe = instanced(g.stripe, new THREE.MeshBasicMaterial());
     const panes = windowTexture();
-    this.windows = instanced(
-      g.windows,
-      new THREE.MeshLambertMaterial({ map: panes, emissive: '#ffffff', emissiveMap: panes, emissiveIntensity: 0.75 }),
-    );
+    this.windowMaterial = new THREE.MeshLambertMaterial({
+      map: panes,
+      emissive: '#ffffff',
+      emissiveMap: panes,
+      emissiveIntensity: 0.75,
+    });
+    this.windows = instanced(g.windows, this.windowMaterial);
     this.bogies = instanced(g.bogies, new THREE.MeshLambertMaterial({ color: '#202329' }));
     this.headlights = instanced(g.lamps, new THREE.MeshBasicMaterial());
     this.taillights = instanced(g.lamps, new THREE.MeshBasicMaterial());
@@ -166,6 +223,16 @@ export class TrainLayer implements CustomLayerInterface {
         opacity: 0.5,
       }),
     );
+    const additive = (map: THREE.Texture) =>
+      new THREE.MeshBasicMaterial({
+        map,
+        transparent: true,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+      });
+    this.trail = instanced(g.patch, additive(glowTexture()));
+    this.beams = instanced(g.patch, additive(beamTexture()));
+
     // Shares the roof's instances: same matrices, line color.
     this.xray = new THREE.InstancedMesh(
       g.body,
@@ -185,6 +252,8 @@ export class TrainLayer implements CustomLayerInterface {
     this.xray.renderOrder = 1;
     this.scene.add(
       this.xray,
+      this.trail,
+      this.beams,
       this.glow,
       this.bogies,
       this.body,
@@ -196,10 +265,10 @@ export class TrainLayer implements CustomLayerInterface {
     );
 
     // The camera has no transform, so the lights live in local meters too.
-    this.scene.add(new THREE.HemisphereLight('#dfe8ff', '#3a4255', 2.8));
-    const sun = new THREE.DirectionalLight('#ffffff', 2.0);
-    sun.position.set(-0.4, -0.7, 1);
-    this.scene.add(sun);
+    this.hemi = new THREE.HemisphereLight('#dfe8ff', '#3a4255', 2.8);
+    this.sun = new THREE.DirectionalLight('#ffffff', 2.0);
+    this.sun.position.set(-0.4, -0.7, 1);
+    this.scene.add(this.hemi, this.sun);
   }
 
   onAdd(map: MapLibreMap, gl: WebGLRenderingContext | WebGL2RenderingContext) {
@@ -207,12 +276,44 @@ export class TrainLayer implements CustomLayerInterface {
     this.renderer.autoClear = false;
   }
 
+  setLighting(l: Lighting) {
+    this.sun.position.set(...l.sun);
+    this.sun.intensity = l.sunIntensity;
+    this.hemi.intensity = l.skyIntensity;
+    this.windowMaterial.emissiveIntensity = 0.35 + 0.65 * l.night;
+  }
+
+  /** Light trails behind moving trains and headlight beams ahead of them. */
+  setGlows(trail: Glow[], beams: Glow[]) {
+    const m = new THREE.Matrix4();
+    const q = new THREE.Quaternion();
+    const z = new THREE.Vector3(0, 0, 1);
+    const pos = new THREE.Vector3();
+    const scale = new THREE.Vector3();
+    for (const [mesh, list] of [
+      [this.trail, trail],
+      [this.beams, beams],
+    ] as const) {
+      const n = Math.min(list.length, MAX_CARS);
+      for (let i = 0; i < n; i++) {
+        const g = list[i];
+        q.setFromAxisAngle(z, g.angle);
+        m.compose(pos.set(g.x, g.y, 0), q, scale.set(g.length, g.width, 1));
+        mesh.setMatrixAt(i, m);
+        mesh.setColorAt(i, g.color);
+      }
+      mesh.count = n;
+      mesh.instanceMatrix.needsUpdate = true;
+      mesh.instanceColor!.needsUpdate = true;
+    }
+  }
+
   /** Lays out this frame's cars. */
   setCars(cars: Car[]) {
     const m = new THREE.Matrix4();
     const lamp = new THREE.Matrix4();
     const q = new THREE.Quaternion();
-    const z = new THREE.Vector3(0, 0, 1);
+    const euler = new THREE.Euler(0, 0, 0, 'ZYX');
     const pos = new THREE.Vector3();
     const scale = new THREE.Vector3();
     const glowColor = new THREE.Color();
@@ -223,7 +324,8 @@ export class TrainLayer implements CustomLayerInterface {
 
     for (let i = 0; i < n; i++) {
       const c = cars[i];
-      q.setFromAxisAngle(z, c.angle);
+      // Heading, then a lean about the car's own length.
+      q.setFromEuler(euler.set(c.roll, 0, c.angle));
       pos.set(c.x, c.y, 0);
       scale.set(c.length, c.width, c.height);
       m.compose(pos, q, scale);

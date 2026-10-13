@@ -1,6 +1,6 @@
 # Live Boston
 
-Boston in real time: every T and commuter rail train, drawn in 3D on a live map of the city.
+Boston in real time: every T, commuter rail and Silver Line vehicle in 3D, Bluebikes, and the city's real sky and weather.
 
 **[jdank417.github.io/live-boston](https://jdank417.github.io/live-boston/)**
 
@@ -15,6 +15,16 @@ Boston in real time: every T and commuter rail train, drawn in 3D on a live map 
 - **☆ Follow** any train to keep it in your **Following** tab with its live
   status; followed trains glow gold on the map (saved on your device)
 - **2D / 3D**: a flat north-up map, or the tilted city with buildings
+- **Silver Line** buses as articulated 3D buses, and **Bluebikes** docks with
+  live classic and e-bike counts
+- **Speed map**: track colored by how fast trains actually move over it, so
+  slow zones show up red. It's measured from the trains' own reports, fills in
+  as you watch, and is kept on your device for six hours
+- **The real sky**: day, dusk and night follow the sun over Boston, lit
+  windows come on after dark, and live weather (rain, snow, fog, storms) plays
+  over the map. Preview with `?hour=21.5` or `?weather=snow`
+- Trains accelerate out of stations and brake into them, trail light behind
+  them, throw headlight beams at night, and ripple the platform as they arrive
 - Link straight to a train (`#train=<vehicle id>`) or a station (`#station=place-pktrm`)
 
 ## How accurate is it?
@@ -25,11 +35,14 @@ than cutting across. In testing, reports sat a median of 3.5 m from their
 track, 57 of 58 moving trains faced the same way as the MBTA's own bearing,
 and small backward jitters are held rather than shown.
 
-About a quarter of moving trains go 12 seconds or more without a new report.
-Rather than freeze them, the app keeps them rolling at their measured speed
-(or the line's typical speed until it has one), never past the stop they're
-heading to and never while the MBTA says they're stopped. A new report then
-corrects them without sliding backwards. Positions are as fresh
+Reports are about 20 seconds old when they arrive, and about a quarter of
+moving trains go a 12-second poll without a new one. So each train is drawn
+where it probably is *now*: its last report, plus how far it has likely gone
+since at its measured speed (or the line's typical speed until it has one),
+never past the stop it's heading to and never while the MBTA says it's
+stopped. The drawn train follows that estimate with realistic acceleration
+and braking, and never reverses. In testing, a new report moved the estimate
+a median of 13 m. Positions are as fresh
 as the MBTA's own reports, usually under 30 seconds old; the panel shows each
 train's age.
 
@@ -43,7 +56,9 @@ the [MBTA V3 API](https://api-v3.mbta.com) every 12 seconds. The map is
 [MapLibre GL](https://maplibre.org) on [OpenFreeMap](https://openfreemap.org)
 tiles with buildings extruded from OpenStreetMap heights, and the trains are
 drawn with [three.js](https://threejs.org) in a custom layer that shares the
-map's depth buffer.
+map's depth buffer. Bluebikes come from the system's public
+[GBFS feed](https://gbfs.bluebikes.com/gbfs/gbfs.json) and the weather from
+[Open-Meteo](https://open-meteo.com); neither needs a key.
 
 Without an API key the MBTA allows 20 requests a minute per visitor, which is
 plenty. To use a key, set `VITE_MBTA_API_KEY` at build time (the deploy
@@ -61,6 +76,6 @@ Pushes to `main` build and deploy to GitHub Pages through
 
 ## Roadmap
 
-- Bluebikes stations with live bike and dock counts
-- Buses
-- Pin a station for a live countdown
+- Pin a station for a live countdown and a "leave now" alert
+- Service alerts on the map
+- Ferries

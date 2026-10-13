@@ -10,6 +10,8 @@ const KEY = import.meta.env.VITE_MBTA_API_KEY as string | undefined;
 
 /** 0 light rail (Green, Mattapan), 1 heavy rail (Red, Orange, Blue), 2 commuter rail. */
 export const ROUTE_TYPES = '0,1,2';
+/** The Silver Line: bus rapid transit, so route type 3, picked out by route. */
+export const SILVER_LINE = ['741', '742', '743', '751', '749', '746'];
 
 interface Resource {
   id: string;
@@ -60,8 +62,10 @@ function time(s: string | null | undefined) {
 export interface Route {
   id: string;
   name: string;
-  /** 0 light rail, 1 heavy rail, 2 commuter rail. */
+  /** 0 light rail, 1 heavy rail, 2 commuter rail, 3 bus (Silver Line). */
   type: number;
+  /** Short name, e.g. "SL1". */
+  short: string;
   color: string;
   destinations: string[];
 }
@@ -75,17 +79,20 @@ export interface Network {
 }
 
 export async function loadNetwork(): Promise<Network> {
-  const routeDoc = await get('/routes', {
-    'filter[type]': ROUTE_TYPES,
-    'fields[route]': 'color,long_name,type,direction_destinations',
-  });
+  const fields = 'color,long_name,short_name,type,direction_destinations';
+  const [rail, silver] = await Promise.all([
+    get('/routes', { 'filter[type]': ROUTE_TYPES, 'fields[route]': fields }),
+    get('/routes', { 'filter[id]': SILVER_LINE.join(','), 'fields[route]': fields }),
+  ]);
   const routes = new Map<string, Route>(
-    routeDoc.data.map((r) => [
+    [...rail.data, ...silver.data].map((r) => [
       r.id,
       {
         id: r.id,
-        name: r.attributes.long_name,
+        // Silver Line long names are the full route ("Logan Airport Terminals - South Station").
+        name: r.attributes.type === 3 ? `Silver Line ${r.attributes.short_name}` : r.attributes.long_name,
         type: r.attributes.type,
+        short: r.attributes.short_name ?? '',
         color: `#${r.attributes.color}`,
         destinations: r.attributes.direction_destinations ?? [],
       },
@@ -131,12 +138,14 @@ export interface Station {
   lng: number;
   lat: number;
   rail: boolean;
+  /** A Silver Line stop that's not also a subway or rail station. */
+  bus: boolean;
 }
 
-async function stationsOf(routeTypes: string, rail: boolean): Promise<Station[]> {
+async function stationsOf(filter: Record<string, string>, rail: boolean, bus = false): Promise<Station[]> {
   // Filtering by route type returns platforms; their parents are the stations.
   const doc = await get('/stops', {
-    'filter[route_type]': routeTypes,
+    ...filter,
     include: 'parent_station',
     'fields[stop]': 'name,latitude,longitude',
   });
@@ -150,16 +159,27 @@ async function stationsOf(routeTypes: string, rail: boolean): Promise<Station[]>
       lng: s.attributes.longitude,
       lat: s.attributes.latitude,
       rail,
+      bus,
     });
   }
   return [...stations.values()];
 }
 
 export async function loadStations(): Promise<Station[]> {
-  const [subway, rail] = await Promise.all([stationsOf('0,1', false), stationsOf('2', true)]);
-  // Stations served by both (South Station, Back Bay, …) count as subway.
-  const ids = new Set(subway.map((s) => s.id));
-  return [...subway, ...rail.filter((s) => !ids.has(s.id))];
+  const [subway, rail, silver] = await Promise.all([
+    stationsOf({ 'filter[route_type]': '0,1' }, false),
+    stationsOf({ 'filter[route_type]': '2' }, true),
+    stationsOf({ 'filter[route]': SILVER_LINE.join(',') }, false, true),
+  ]);
+  // Stations served by several (South Station, Back Bay, …) count as subway.
+  const out: Station[] = [];
+  const ids = new Set<string>();
+  for (const s of [...subway, ...rail, ...silver]) {
+    if (ids.has(s.id)) continue;
+    ids.add(s.id);
+    out.push(s);
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -193,9 +213,10 @@ export interface Vehicle {
   updatedAt: number;
 }
 
-export async function loadVehicles(): Promise<Vehicle[]> {
+/** Every vehicle on these routes, in one request. */
+export async function loadVehicles(routeIds: string[]): Promise<Vehicle[]> {
   const doc = await get('/vehicles', {
-    'filter[route_type]': ROUTE_TYPES,
+    'filter[route]': routeIds.join(','),
     include: 'trip,stop',
     'fields[vehicle]':
       'label,latitude,longitude,bearing,speed,current_status,direction_id,carriages,updated_at',
@@ -274,7 +295,6 @@ export interface Departure {
 export async function loadDepartures(stationId: string): Promise<Departure[]> {
   const doc = await get('/predictions', {
     'filter[stop]': stationId,
-    'filter[route_type]': ROUTE_TYPES,
     include: 'trip',
     'fields[prediction]': 'arrival_time,departure_time,direction_id',
     'fields[trip]': 'headsign',

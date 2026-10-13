@@ -40,6 +40,15 @@ button {
   inset: 0;
 }
 
+/* Rain and snow, drawn over the map but under the interface. */
+#weather-fx {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
 /* Darkens the edges so the floating glass reads, without touching the center. */
 .vignette {
   position: absolute;
@@ -116,6 +125,27 @@ button {
 
 #clock .sec {
   color: var(--dim);
+}
+
+#conditions {
+  margin: 6px 0 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+/* Fog and rain soften the whole scene a little. */
+body[data-weather='fog'] .vignette {
+  background:
+    linear-gradient(rgba(150, 160, 180, 0.16), rgba(150, 160, 180, 0.16)),
+    radial-gradient(ellipse 120% 90% at 50% 45%, transparent 55%, rgba(4, 6, 11, 0.55) 100%);
+}
+
+body[data-weather='rain'] .vignette,
+body[data-weather='storm'] .vignette {
+  background:
+    linear-gradient(rgba(20, 30, 50, 0.18), rgba(20, 30, 50, 0.18)),
+    radial-gradient(ellipse 120% 90% at 50% 45%, transparent 55%, rgba(4, 6, 11, 0.6) 100%);
 }
 
 #clock .ampm {
@@ -238,8 +268,11 @@ button {
 #dock {
   position: absolute;
   bottom: 22px;
-  left: 50%;
-  transform: translateX(-50%);
+  /* Centered by margins, not a transform, so it can grow to fit its chips. */
+  left: 0;
+  right: 0;
+  margin: 0 auto;
+  width: fit-content;
   display: flex;
   gap: 4px;
   padding: 6px;
@@ -286,6 +319,77 @@ button {
   font-family: var(--mono);
   font-size: 12px;
   color: var(--muted);
+}
+
+.chip svg {
+  width: 15px;
+  height: 15px;
+  color: var(--muted);
+}
+
+.chip.toggle.on {
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.chip.toggle.on svg {
+  color: var(--text);
+}
+
+.divider {
+  flex: none;
+  width: 1px;
+  margin: 6px 4px;
+  background: var(--edge-strong);
+}
+
+#speed-legend {
+  position: absolute;
+  bottom: 80px;
+  left: 0;
+  right: 0;
+  margin: 0 auto;
+  width: fit-content;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 12px;
+  border-radius: 999px;
+  background: var(--glass);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  border: 1px solid var(--edge);
+  font-size: 11.5px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+#speed-legend[hidden] {
+  display: none;
+}
+
+#speed-legend .title {
+  color: var(--muted);
+  margin-right: 4px;
+}
+
+#speed-legend .step {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-family: var(--mono);
+}
+
+#speed-legend .step::before {
+  content: '';
+  width: 14px;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--c);
+  box-shadow: 0 0 6px var(--c);
+}
+
+#speed-legend .unit {
+  color: var(--dim);
 }
 
 .chip.off {
@@ -459,7 +563,7 @@ button {
 .actions .primary {
   background: var(--c);
   border-color: transparent;
-  color: #fff;
+  color: var(--on-c, #fff);
   box-shadow: 0 6px 24px color-mix(in srgb, var(--c) 45%, transparent);
 }
 
@@ -649,6 +753,37 @@ button {
   line-height: 1.5;
 }
 
+/* Bluebikes dock */
+
+.bike-stats {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.bike-stats div {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 12px;
+  border-radius: 12px;
+  border: 1px solid var(--edge);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.bike-stats .n {
+  font-family: var(--display);
+  font-size: 30px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.bike-stats .k {
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
 /* Station departure board */
 
 .board {
@@ -793,11 +928,25 @@ button {
     display: none;
   }
 
+  #speed-legend {
+    bottom: 72px;
+    left: 12px;
+    right: 12px;
+    width: auto;
+    justify-content: center;
+    font-size: 10.5px;
+    gap: 4px;
+  }
+
+  #speed-legend .title {
+    display: none;
+  }
+
   #dock {
     bottom: 14px;
     left: 12px;
     right: 12px;
-    transform: none;
+    width: auto;
     max-width: none;
   }
 

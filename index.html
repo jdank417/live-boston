@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
-    <meta name="description" content="Boston in real time: every T and commuter rail train, in 3D, on a live map of the city." />
+    <meta name="description" content="Boston in real time: every T, commuter rail and Silver Line vehicle in 3D, Bluebikes, and the city's real sky and weather." />
     <meta name="theme-color" content="#090c13" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -15,11 +15,13 @@
   </head>
   <body>
     <div id="map"></div>
+    <canvas id="weather-fx" aria-hidden="true"></canvas>
     <div class="vignette" aria-hidden="true"></div>
 
     <header id="brand">
       <div class="title"><span class="live" aria-hidden="true"></span>Live Boston</div>
       <div id="clock" aria-label="Boston time"></div>
+      <p id="conditions" hidden></p>
       <p id="summary" role="status"></p>
       <div class="controls">
         <button id="tour" aria-pressed="false" title="Ride random trains around the city">
@@ -49,7 +51,8 @@
 
     <section id="panel" hidden aria-live="polite"></section>
 
-    <nav id="dock" aria-label="Lines"></nav>
+    <div id="speed-legend" hidden></div>
+    <nav id="dock" aria-label="Lines and layers"></nav>
 
     <script type="module" src="/src/main.ts"></script>
   </body>
