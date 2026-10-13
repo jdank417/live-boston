@@ -51,56 +51,46 @@ export function skyAt(date: Date): SkyState {
   };
 }
 
-// Palettes ------------------------------------------------------------------
+/** Today's sunrise and sunset in Boston (the moments the sun's top edge crosses the horizon). */
+export function sunTimes(date: Date) {
+  const start = new Date(date);
+  start.setHours(0, 0, 0, 0);
+  let rise: Date | null = null;
+  let set: Date | null = null;
+  let prev = sunPosition(start).altitude;
+  for (let m = 2; m <= 24 * 60; m += 2) {
+    const t = new Date(start.getTime() + m * 60_000);
+    const alt = sunPosition(t).altitude;
+    const horizon = -0.833 * RAD;
+    if (prev < horizon && alt >= horizon) rise = t;
+    if (prev >= horizon && alt < horizon) set = t;
+    prev = alt;
+  }
+  return { rise, set };
+}
+
+// The sky behind the city at night, at sunrise or sunset, and by day. The map
+// itself stays dark at all hours so the lines always read; the sky and the
+// light on the buildings are what change.
 
 type Triple = [night: string, dusk: string, day: string];
 
-/** Basemap layer colors through the day. Day stays moody rather than bright. */
-export const BASEMAP: Record<string, [prop: string, colors: Triple]> = {
-  background: ['background-color', ['#090c13', '#1a1724', '#3a4456']],
-  water: ['fill-color', ['#0a1a2f', '#1d2440', '#2b6aa8']],
-  waterway: ['line-color', ['#0d2038', '#232b48', '#3576b5']],
-  landuse_park: ['fill-color', ['#0c1612', '#1a2120', '#35573f']],
-  landcover_wood: ['fill-color', ['#0c1612', '#1a2120', '#35573f']],
-  landuse_residential: ['fill-color', ['#0b0f17', '#1b1a26', '#414b5e']],
-  building: ['fill-color', ['#0e131c', '#211e2b', '#4c566b']],
-  highway_minor: ['line-color', ['#151b26', '#29283a', '#555f76']],
-  highway_major_inner: ['line-color', ['#121925', '#2a2838', '#5d6882']],
-  highway_major_casing: ['line-color', ['rgba(70,88,120,0.45)', 'rgba(120,100,120,0.5)', 'rgba(120,140,175,0.6)']],
-  highway_major_subtle: ['line-color', ['#1b2331', '#2e2c3d', '#5d6882']],
-  highway_motorway_casing: ['line-color', ['rgba(90,110,150,0.5)', 'rgba(140,110,120,0.55)', 'rgba(140,160,200,0.6)']],
-  highway_motorway_subtle: ['line-color', ['#1a2230', '#302c3c', '#65708a']],
-};
-
 export const SKY: Record<string, Triple> = {
-  'sky-color': ['#0a1324', '#2a2f5e', '#5c95d6'],
-  'horizon-color': ['#1c2d4d', '#ff8c5a', '#a8c8ec'],
-  'fog-color': ['#090c13', '#3a2c3c', '#7d93b3'],
+  'sky-color': ['#070a12', '#1d2347', '#2d4f80'],
+  'horizon-color': ['#141c30', '#c9714a', '#6f93bd'],
+  'fog-color': ['#0a0c10', '#141218', '#10141b'],
 };
 
-/** Buildings: [low, tall] colors, and the warm glow of lit windows after dark. */
-export const BUILDINGS = {
-  low: ['#141b28', '#2a2533', '#66728a'] as Triple,
-  tall: ['#2d3f5e', '#4a3f5a', '#aab6cc'] as Triple,
-  lit: ['#5e4630', '#4a3a36', '#66728a'] as Triple,
-};
-
-/** "#rrggbb" or "rgba(r,g,b,a)" as sRGB 0–255 channels and alpha. */
-function parse(c: string): [number, number, number, number] {
-  const m = c.match(/rgba?\(([^)]+)\)/);
-  if (m) {
-    const [r, g, b, a = 1] = m[1].split(',').map(Number);
-    return [r, g, b, a];
-  }
+/** "#rrggbb" as sRGB 0–255 channels. */
+function parse(c: string): [number, number, number] {
   const n = parseInt(c.slice(1), 16);
-  return [(n >> 16) & 255, (n >> 8) & 255, n & 255, 1];
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
 }
 
 const mix = (a: number[], b: number[], t: number) => a.map((v, i) => v + (b[i] - v) * t);
 
 /** Picks a color for this moment: night → dusk → day, blending as the sun moves. */
 export function blend([night, dusk, day]: Triple, s: SkyState): string {
-  const c = mix(mix(parse(night), parse(day), s.day), parse(dusk), s.dusk * 0.85);
-  const [r, g, b] = c.slice(0, 3).map(Math.round);
-  return c[3] >= 0.999 ? `rgb(${r},${g},${b})` : `rgba(${r},${g},${b},${c[3].toFixed(2)})`;
+  const [r, g, b] = mix(mix(parse(night), parse(day), s.day), parse(dusk), s.dusk * 0.85).map(Math.round);
+  return `rgb(${r},${g},${b})`;
 }

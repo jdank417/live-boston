@@ -15,74 +15,54 @@ export interface Car {
   height: number;
   body: THREE.Color;
   accent: THREE.Color;
-  /** Lead car gets headlights; the last car gets taillights. */
-  front: boolean;
-  rear: boolean;
   selected: boolean;
-  /** On your Following list: glows gold. */
+  /** On your Following list. */
   followed: boolean;
   /** Side-to-side lean in radians, for a little sway at speed. */
   roll: number;
 }
 
-/** A soft patch of light on the ground: trail behind a train, or a headlight beam ahead. */
-export interface Glow {
-  x: number;
-  y: number;
-  angle: number;
-  length: number;
-  width: number;
-  /** Already scaled by brightness; the blend is additive, so darker is fainter. */
-  color: THREE.Color;
-}
-
 /** Sun and sky, from the real time of day (see sky.ts). */
 export interface Lighting {
-  /** Unit vector toward the sun, local x east, y north, z up. */
+  /** Unit vector toward the light, local x east, y north, z up. */
   sun: [number, number, number];
   sunIntensity: number;
   skyIntensity: number;
-  /** 0 by day, 1 at night: lit windows and headlight beams come up with it. */
+  /** 0 by day, 1 at night: the windows glow brighter after dark. */
   night: number;
 }
 
 const MAX_CARS = 3000;
 const WHITE = new THREE.Color('#ffffff');
-const HEADLIGHT = new THREE.Color('#fff4d6');
-const TAILLIGHT = new THREE.Color('#ff2a2a');
-const GOLD = new THREE.Color('#ffd166');
+const SHADOW = new THREE.Color('#000000');
+const GOLD = new THREE.Color('#ffc94d');
 
 // Every part is modelled in a unit car: x is length (-0.5 to 0.5, front at
 // +0.5), y is width, z is height from 0 (rail) to 1 (roof). Each instance is
 // then scaled to the real car's dimensions.
 
 function unitParts() {
-  const body = new RoundedBoxGeometry(1, 1, 0.84, 3, 0.035).translate(0, 0, 0.1 + 0.42);
-  const roof = new THREE.BoxGeometry(0.94, 0.84, 0.05).translate(0, 0, 0.955);
-  const stripe = new THREE.BoxGeometry(0.985, 1.02, 0.1).translate(0, 0, 0.36);
-  const windows = new THREE.BoxGeometry(0.97, 1.015, 0.3).translate(0, 0, 0.62);
+  const body = new RoundedBoxGeometry(1, 1, 0.84, 4, 0.04).translate(0, 0, 0.1 + 0.42);
+  const roof = new THREE.BoxGeometry(0.95, 0.82, 0.04).translate(0, 0, 0.955);
+  const stripe = new THREE.BoxGeometry(0.985, 1.012, 0.08).translate(0, 0, 0.34);
+  const windows = new THREE.BoxGeometry(0.97, 1.008, 0.3).translate(0, 0, 0.62);
   const bogies = mergeGeometries([
-    new THREE.BoxGeometry(0.16, 0.8, 0.12).translate(0.32, 0, 0.06),
-    new THREE.BoxGeometry(0.16, 0.8, 0.12).translate(-0.32, 0, 0.06),
+    new THREE.BoxGeometry(0.16, 0.78, 0.12).translate(0.32, 0, 0.06),
+    new THREE.BoxGeometry(0.16, 0.78, 0.12).translate(-0.32, 0, 0.06),
   ]);
-  const lamps = mergeGeometries([
-    new THREE.BoxGeometry(0.012, 0.16, 0.07).translate(0.497, 0.3, 0.3),
-    new THREE.BoxGeometry(0.012, 0.16, 0.07).translate(0.497, -0.3, 0.3),
-  ]);
-  const glow = new THREE.PlaneGeometry(1.6, 5).translate(0, 0, 0.004);
-  // Trails and beams are sized per instance in meters, not by the car.
-  const patch = new THREE.PlaneGeometry(1, 1).translate(0, 0, 0.05);
-  return { body, roof, stripe, windows, bogies, lamps, glow, patch };
+  // A soft shadow pooled under the car, a little longer and wider than it.
+  const shadow = new THREE.PlaneGeometry(1.25, 2.2).translate(0, 0, 0.003);
+  return { body, roof, stripe, windows, bogies, shadow };
 }
 
 /** Side windows and doors for one car, lit from inside. */
 function windowTexture() {
-  const w = 512;
-  const h = 64;
+  const w = 1024;
+  const h = 128;
   const ctx = document.createElement('canvas').getContext('2d')!;
   ctx.canvas.width = w;
   ctx.canvas.height = h;
-  ctx.fillStyle = '#0a0d12';
+  ctx.fillStyle = '#0b0e13';
   ctx.fillRect(0, 0, w, h);
   // Three door pairs per side, with window bays between them.
   const doors = [0.17, 0.5, 0.83];
@@ -94,58 +74,39 @@ function windowTexture() {
     [0.88, 0.97],
   ];
   const glass = ctx.createLinearGradient(0, 0, 0, h);
-  glass.addColorStop(0, '#fff1d0');
-  glass.addColorStop(1, '#f2c27a');
+  glass.addColorStop(0, '#fff3da');
+  glass.addColorStop(1, '#f0c88e');
+  const pane = (x: number, y: number, pw: number, ph: number) => {
+    ctx.beginPath();
+    ctx.roundRect(x, y, pw, ph, 6);
+    ctx.fill();
+  };
   ctx.fillStyle = glass;
   for (const [a, b] of bays) {
     const panes = Math.max(1, Math.round((b - a) * 10));
     const paneW = ((b - a) * w) / panes;
-    for (let i = 0; i < panes; i++) ctx.fillRect(a * w + i * paneW + 3, 10, paneW - 6, h - 20);
+    for (let i = 0; i < panes; i++) pane(a * w + i * paneW + 6, 20, paneW - 12, h - 40);
   }
   for (const d of doors) {
-    ctx.fillStyle = '#2a2f38';
+    ctx.fillStyle = '#262b33';
     ctx.fillRect(d * w - doorW / 2, 0, doorW, h);
     ctx.fillStyle = glass;
-    ctx.fillRect(d * w - doorW / 2 + 5, 8, doorW / 2 - 8, h * 0.55);
-    ctx.fillRect(d * w + 3, 8, doorW / 2 - 8, h * 0.55);
+    pane(d * w - doorW / 2 + 8, 16, doorW / 2 - 14, h * 0.55);
+    pane(d * w + 6, 16, doorW / 2 - 14, h * 0.55);
   }
   const tex = new THREE.CanvasTexture(ctx.canvas);
   tex.colorSpace = THREE.SRGBColorSpace;
-  tex.anisotropy = 4;
+  tex.anisotropy = 8;
   return tex;
 }
 
-/** Bright at the near end, fading out along the beam. */
-function beamTexture() {
-  const w = 256;
-  const h = 64;
-  const ctx = document.createElement('canvas').getContext('2d')!;
-  ctx.canvas.width = w;
-  ctx.canvas.height = h;
-  const along = ctx.createLinearGradient(0, 0, w, 0);
-  along.addColorStop(0, 'rgba(255,255,255,0)');
-  along.addColorStop(0.08, 'rgba(255,255,255,0.9)');
-  along.addColorStop(1, 'rgba(255,255,255,0)');
-  ctx.fillStyle = along;
-  ctx.fillRect(0, 0, w, h);
-  // Soften the sides.
-  ctx.globalCompositeOperation = 'destination-in';
-  const across = ctx.createLinearGradient(0, 0, 0, h);
-  across.addColorStop(0, 'rgba(0,0,0,0)');
-  across.addColorStop(0.5, 'rgba(0,0,0,1)');
-  across.addColorStop(1, 'rgba(0,0,0,0)');
-  ctx.fillStyle = across;
-  ctx.fillRect(0, 0, w, h);
-  return new THREE.CanvasTexture(ctx.canvas);
-}
-
-function glowTexture() {
+function shadowTexture() {
   const size = 128;
   const ctx = document.createElement('canvas').getContext('2d')!;
   ctx.canvas.width = ctx.canvas.height = size;
   const g = ctx.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
-  g.addColorStop(0, 'rgba(255,255,255,0.9)');
-  g.addColorStop(0.35, 'rgba(255,255,255,0.35)');
+  g.addColorStop(0, 'rgba(255,255,255,0.85)');
+  g.addColorStop(0.5, 'rgba(255,255,255,0.45)');
   g.addColorStop(1, 'rgba(255,255,255,0)');
   ctx.fillStyle = g;
   ctx.fillRect(0, 0, size, size);
@@ -185,62 +146,41 @@ export class TrainLayer implements CustomLayerInterface {
   private readonly stripe;
   private readonly windows;
   private readonly bogies;
-  private readonly headlights;
-  private readonly taillights;
-  private readonly glow;
-  private readonly trail;
-  private readonly beams;
+  private readonly shadow;
+  /** Faint line-colored silhouettes of whatever buildings hide. */
+  private readonly xray;
   private readonly windowMaterial;
   private readonly hemi;
   private readonly sun;
-  /** Line-colored silhouettes of whatever buildings hide (underground stations, downtown). */
-  private readonly xray;
 
   constructor() {
     const g = unitParts();
     this.body = instanced(g.body, new THREE.MeshLambertMaterial());
     this.roof = instanced(g.roof, new THREE.MeshLambertMaterial());
-    // Unlit, so the line color reads as a lit livery band at night.
+    // Unlit, so the line color reads as a clean livery band.
     this.stripe = instanced(g.stripe, new THREE.MeshBasicMaterial());
     const panes = windowTexture();
     this.windowMaterial = new THREE.MeshLambertMaterial({
       map: panes,
       emissive: '#ffffff',
       emissiveMap: panes,
-      emissiveIntensity: 0.75,
+      emissiveIntensity: 0.6,
     });
     this.windows = instanced(g.windows, this.windowMaterial);
-    this.bogies = instanced(g.bogies, new THREE.MeshLambertMaterial({ color: '#202329' }));
-    this.headlights = instanced(g.lamps, new THREE.MeshBasicMaterial());
-    this.taillights = instanced(g.lamps, new THREE.MeshBasicMaterial());
-    this.glow = instanced(
-      g.glow,
-      new THREE.MeshBasicMaterial({
-        map: glowTexture(),
-        transparent: true,
-        depthWrite: false,
-        blending: THREE.AdditiveBlending,
-        opacity: 0.5,
-      }),
+    this.bogies = instanced(g.bogies, new THREE.MeshLambertMaterial({ color: '#1c1f25' }));
+    this.shadow = instanced(
+      g.shadow,
+      new THREE.MeshBasicMaterial({ map: shadowTexture(), transparent: true, depthWrite: false, opacity: 0.7 }),
     );
-    const additive = (map: THREE.Texture) =>
-      new THREE.MeshBasicMaterial({
-        map,
-        transparent: true,
-        depthWrite: false,
-        blending: THREE.AdditiveBlending,
-      });
-    this.trail = instanced(g.patch, additive(glowTexture()));
-    this.beams = instanced(g.patch, additive(beamTexture()));
 
     // Shares the roof's instances: same matrices, line color.
     this.xray = new THREE.InstancedMesh(
       g.body,
       new THREE.MeshBasicMaterial({
         transparent: true,
-        opacity: 0.4,
+        opacity: 0.22,
         depthWrite: false,
-        // Only where something nearer is already drawn, i.e. the hidden parts.
+        // Only where something nearer is already drawn: the hidden parts.
         depthFunc: THREE.GreaterDepth,
       }),
       MAX_CARS,
@@ -250,23 +190,12 @@ export class TrainLayer implements CustomLayerInterface {
     this.xray.frustumCulled = false;
     this.xray.count = 0;
     this.xray.renderOrder = 1;
-    this.scene.add(
-      this.xray,
-      this.trail,
-      this.beams,
-      this.glow,
-      this.bogies,
-      this.body,
-      this.roof,
-      this.stripe,
-      this.windows,
-      this.headlights,
-      this.taillights,
-    );
+
+    this.scene.add(this.shadow, this.bogies, this.body, this.roof, this.stripe, this.windows, this.xray);
 
     // The camera has no transform, so the lights live in local meters too.
-    this.hemi = new THREE.HemisphereLight('#dfe8ff', '#3a4255', 2.8);
-    this.sun = new THREE.DirectionalLight('#ffffff', 2.0);
+    this.hemi = new THREE.HemisphereLight('#e4ecff', '#30384a', 2.6);
+    this.sun = new THREE.DirectionalLight('#ffffff', 1.8);
     this.sun.position.set(-0.4, -0.7, 1);
     this.scene.add(this.hemi, this.sun);
   }
@@ -280,46 +209,17 @@ export class TrainLayer implements CustomLayerInterface {
     this.sun.position.set(...l.sun);
     this.sun.intensity = l.sunIntensity;
     this.hemi.intensity = l.skyIntensity;
-    this.windowMaterial.emissiveIntensity = 0.35 + 0.65 * l.night;
-  }
-
-  /** Light trails behind moving trains and headlight beams ahead of them. */
-  setGlows(trail: Glow[], beams: Glow[]) {
-    const m = new THREE.Matrix4();
-    const q = new THREE.Quaternion();
-    const z = new THREE.Vector3(0, 0, 1);
-    const pos = new THREE.Vector3();
-    const scale = new THREE.Vector3();
-    for (const [mesh, list] of [
-      [this.trail, trail],
-      [this.beams, beams],
-    ] as const) {
-      const n = Math.min(list.length, MAX_CARS);
-      for (let i = 0; i < n; i++) {
-        const g = list[i];
-        q.setFromAxisAngle(z, g.angle);
-        m.compose(pos.set(g.x, g.y, 0), q, scale.set(g.length, g.width, 1));
-        mesh.setMatrixAt(i, m);
-        mesh.setColorAt(i, g.color);
-      }
-      mesh.count = n;
-      mesh.instanceMatrix.needsUpdate = true;
-      mesh.instanceColor!.needsUpdate = true;
-    }
+    this.windowMaterial.emissiveIntensity = 0.3 + 0.55 * l.night;
   }
 
   /** Lays out this frame's cars. */
   setCars(cars: Car[]) {
     const m = new THREE.Matrix4();
-    const lamp = new THREE.Matrix4();
     const q = new THREE.Quaternion();
     const euler = new THREE.Euler(0, 0, 0, 'ZYX');
     const pos = new THREE.Vector3();
     const scale = new THREE.Vector3();
-    const glowColor = new THREE.Color();
-    const flip = new THREE.Matrix4().makeRotationZ(Math.PI);
-    let heads = 0;
-    let tails = 0;
+    const under = new THREE.Color();
     const n = Math.min(cars.length, MAX_CARS);
 
     for (let i = 0; i < n; i++) {
@@ -329,7 +229,7 @@ export class TrainLayer implements CustomLayerInterface {
       pos.set(c.x, c.y, 0);
       scale.set(c.length, c.width, c.height);
       m.compose(pos, q, scale);
-      for (const mesh of [this.body, this.roof, this.stripe, this.windows, this.bogies, this.glow]) {
+      for (const mesh of [this.body, this.roof, this.stripe, this.windows, this.bogies, this.shadow]) {
         mesh.setMatrixAt(i, m);
       }
       this.body.setColorAt(i, c.body);
@@ -337,34 +237,16 @@ export class TrainLayer implements CustomLayerInterface {
       this.stripe.setColorAt(i, c.accent);
       this.windows.setColorAt(i, WHITE);
       this.bogies.setColorAt(i, WHITE);
-      glowColor.copy(c.accent);
-      if (c.followed) glowColor.lerp(GOLD, 0.75).multiplyScalar(1.4);
-      if (c.selected) glowColor.lerp(WHITE, 0.6).multiplyScalar(1.6);
-      this.glow.setColorAt(i, glowColor);
-
-      if (c.front) {
-        this.headlights.setMatrixAt(heads, m);
-        this.headlights.setColorAt(heads++, HEADLIGHT);
-      }
-      if (c.rear) {
-        lamp.multiplyMatrices(m, flip);
-        this.taillights.setMatrixAt(tails, lamp);
-        this.taillights.setColorAt(tails++, TAILLIGHT);
-      }
+      // The pool under a car is its shadow, or a glow when it's picked out.
+      this.shadow.setColorAt(i, c.selected ? under.copy(c.accent) : c.followed ? GOLD : SHADOW);
     }
 
-    for (const mesh of [this.body, this.roof, this.stripe, this.windows, this.bogies, this.glow]) {
+    for (const mesh of [this.body, this.roof, this.stripe, this.windows, this.bogies, this.shadow]) {
       mesh.count = n;
       mesh.instanceMatrix.needsUpdate = true;
       mesh.instanceColor!.needsUpdate = true;
     }
     this.xray.count = n;
-    this.headlights.count = heads;
-    this.taillights.count = tails;
-    for (const mesh of [this.headlights, this.taillights]) {
-      mesh.instanceMatrix.needsUpdate = true;
-      mesh.instanceColor!.needsUpdate = true;
-    }
   }
 
   render(_gl: WebGLRenderingContext | WebGL2RenderingContext, args: CustomRenderMethodInput) {

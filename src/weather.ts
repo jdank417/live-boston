@@ -95,10 +95,13 @@ export class Precipitation {
     addEventListener('resize', resize);
   }
 
+  /** Whether to draw anything at all; the weather is still tracked when off. */
+  enabled = true;
+
   set(weather: Weather) {
     this.weather = weather;
     const falling = weather.kind === 'rain' || weather.kind === 'storm' || weather.kind === 'snow';
-    const n = falling ? Math.round((weather.kind === 'snow' ? 260 : 420) * (0.35 + 0.65 * weather.intensity)) : 0;
+    const n = falling ? Math.round((weather.kind === 'snow' ? 160 : 220) * (0.35 + 0.65 * weather.intensity)) : 0;
     this.particles = Array.from({ length: n }, () => this.spawn(true));
   }
 
@@ -108,7 +111,7 @@ export class Precipitation {
       x: Math.random() * (innerWidth + 200) - 100,
       y: anywhere ? Math.random() * innerHeight : -20,
       speed: snow ? 30 + Math.random() * 50 : 700 + Math.random() * 500,
-      size: snow ? 1 + Math.random() * 2.2 : 10 + Math.random() * 14,
+      size: snow ? 0.8 + Math.random() * 1.6 : 12 + Math.random() * 12,
       phase: Math.random() * Math.PI * 2,
     };
   }
@@ -120,14 +123,15 @@ export class Precipitation {
   frame(dt: number, bearing: number, now: number) {
     const { ctx, weather } = this;
     ctx.clearRect(0, 0, innerWidth, innerHeight);
+    if (!this.enabled) return;
     const snow = weather.kind === 'snow';
     // Screen-space sideways drift from the wind, relative to the camera.
     const toward = ((weather.windFrom + 180 - bearing) * Math.PI) / 180;
     const drift = Math.sin(toward) * Math.min(1, weather.wind / 12);
 
     if (this.particles.length) {
-      ctx.strokeStyle = 'rgba(190,210,255,0.32)';
-      ctx.fillStyle = 'rgba(240,245,255,0.8)';
+      ctx.strokeStyle = 'rgba(200,215,255,0.16)';
+      ctx.fillStyle = 'rgba(240,245,255,0.55)';
       ctx.lineWidth = 1;
       ctx.beginPath();
       for (const p of this.particles) {
@@ -155,7 +159,7 @@ export class Precipitation {
         this.nextFlash = now + 6000 + Math.random() * 14000;
       }
       if (this.flash > 0) {
-        const a = this.flash > 0.6 ? 0.35 : this.flash > 0.4 ? 0 : this.flash * 0.5;
+        const a = this.flash > 0.6 ? 0.18 : this.flash > 0.4 ? 0 : this.flash * 0.25;
         ctx.fillStyle = `rgba(220,230,255,${a})`;
         ctx.fillRect(0, 0, innerWidth, innerHeight);
         this.flash -= dt * 2.5;

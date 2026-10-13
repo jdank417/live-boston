@@ -4,28 +4,25 @@ Boston in real time: every T, commuter rail and Silver Line vehicle in 3D, Blueb
 
 **[jdank417.github.io/live-boston](https://jdank417.github.io/live-boston/)**
 
-- Every Red, Orange, Blue, Green, Mattapan and commuter rail train as a real 3D
-  train: the actual number of cars it's running (as the MBTA reports it), true
-  car dimensions, lit windows, headlights and taillights
-- Each car follows the curves of its own track, and trains hidden by buildings
-  or underground stations show through as a faint outline
-- **Ride along** puts the camera behind a train and turns with the track;
-  **Tour** hops between trains on its own
-- Tap a train for its next stops and speed, or a station for its live departure board
-- **☆ Follow** any train to keep it in your **Following** tab with its live
-  status; followed trains glow gold on the map (saved on your device)
-- **2D / 3D**: a flat north-up map, or the tilted city with buildings
-- **Silver Line** buses as articulated 3D buses, and **Bluebikes** docks with
-  live classic and e-bike counts
+- Every Red, Orange, Blue, Green, Mattapan, Silver Line and commuter rail
+  vehicle, live: crisp dots from afar, and real 3D trains up close with the
+  actual number of cars the MBTA reports, true car dimensions and lit windows.
+  Cars follow the curves of their own track, and trains hidden by buildings or
+  underground show through as a faint outline
+- One sidebar (a draggable bottom sheet on phones) with three tabs: **Lines**
+  with live counts, toggles and tap-to-zoom; **Following**, for trains you've
+  starred; and **Map**, for 2D/3D, layers and today's sunrise and sunset
+- **Ride along** steps the interface aside and follows a train with a minimal
+  caption bar; **Take the tour** hops between trains on its own
+- Tap a train for its next stops and speed, a station for its departures, or a
+  Bluebikes dock for bikes and open docks
 - **Speed map**: track colored by how fast trains actually move over it, so
-  slow zones show up red. It's measured from the trains' own reports, fills in
-  as you watch, and is kept on your device for six hours
-- **The real sky**: day, dusk and night follow the sun over Boston, lit
-  windows come on after dark, and live weather (rain, snow, fog, storms) plays
-  over the map. Preview with `?hour=21.5` or `?weather=snow`
-- Trains accelerate out of stations and brake into them, trail light behind
-  them, throw headlight beams at night, and ripple the platform as they arrive
-- Link straight to a train (`#train=<vehicle id>`) or a station (`#station=place-pktrm`)
+  slow zones show up red. Measured from the trains' own reports, it fills in
+  as you watch and is kept on your device for six hours
+- A quiet custom basemap, light that follows the real sun over Boston, and live
+  weather (rain, snow, fog, storms). Preview with `?hour=21.5` or `?weather=snow`
+- Link straight to a train (`#train=<vehicle id>`), a station
+  (`#station=place-pktrm`) or your list (`#following`)
 
 ## How accurate is it?
 
