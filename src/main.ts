@@ -466,7 +466,8 @@ function addLayers() {
     type: 'circle',
     source: 'arrivals',
     paint: {
-      'circle-radius': ['*', ['get', 't'], ['interpolate', ['linear'], ['zoom'], 11, 18, 16, 60]],
+      // Zoom has to lead the expression, so the ring's growth goes inside each stop.
+      'circle-radius': ['interpolate', ['linear'], ['zoom'], 11, ['*', ['get', 't'], 18], 16, ['*', ['get', 't'], 60]],
       'circle-color': 'transparent',
       'circle-stroke-color': ['get', 'color'],
       'circle-stroke-width': ['*', ['-', 1, ['get', 't']], 3],
