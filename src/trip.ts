@@ -531,6 +531,9 @@ async function fetchWalk(from: Place, to: Place) {
       { lat: to.lat, lon: to.lng },
     ],
     costing: 'pedestrian',
+    // On foot means on foot: Valhalla will otherwise walk you onto a ferry.
+    // Boats are rides, and the planner already offers them as rides.
+    costing_options: { pedestrian: { use_ferry: 0 } },
     directions_type: 'none',
   };
   try {
@@ -545,6 +548,8 @@ async function fetchWalk(from: Place, to: Place) {
     const json = await res.json();
     const leg = json.trip?.legs?.[0];
     if (!leg?.shape) return null;
+    // Still a boat in it (no other way there on foot): draw it straight rather than across the water as a walk.
+    if (json.trip.summary?.has_ferry) return null;
     return { path: decode6(leg.shape), meters: leg.summary.length * 1000, seconds: leg.summary.time };
   } catch {
     return null;
