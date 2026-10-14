@@ -28,7 +28,9 @@ Boston in real time: every T, commuter rail, Silver Line, ferry and Amtrak train
   has live times: which train to catch, where it is right now (tap to watch
   it come), how many stops, and where to get off. **Preview the trip** flies
   the camera along the whole route in 3D. Other ways are listed beside the
-  fastest, and "Directions here" on any station starts one
+  fastest (ferries and commuter rail too, when one gets you there sooner),
+  and "Directions here" on any station starts one. **Plan ahead** with
+  "Leave at" or "Arrive by" a day and time, from the timetable
 - **My commute**: save a trip and the top of the sidebar counts down to when
   to leave, timed from where you are now. At the far end it turns around for
   the way back. There's an optional reminder while the app is open
@@ -108,5 +110,4 @@ Pushes to `main` build and deploy to GitHub Pages through
 
 ## Roadmap
 
-- Plan ahead: leave at or arrive by a chosen time
 - Account for service alerts (suspensions, shuttles) when picking a route

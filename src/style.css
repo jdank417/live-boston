@@ -2247,7 +2247,9 @@ button.od-row:hover {
   align-items: center;
   justify-content: center;
   min-width: 0;
+  padding: 0 3px;
   overflow: hidden;
+  text-overflow: clip;
   border-radius: 7px;
   font-size: 11.5px;
   font-weight: 700;
@@ -2326,9 +2328,11 @@ button.od-row:hover {
   border-radius: 10px;
   background: var(--c);
   color: #fff;
-  font-size: 11px;
+  font-size: 10.5px;
   font-weight: 700;
-  letter-spacing: -0.01em;
+  letter-spacing: -0.02em;
+  white-space: nowrap;
+  overflow: hidden;
   text-shadow: 0 1px 1px rgba(0, 0, 0, 0.25);
 }
 
@@ -2416,10 +2420,76 @@ button.od-row:hover {
   cursor: pointer;
 }
 
+.live-train .live-where {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .live-train .link {
+  flex: none;
   margin-left: auto;
   padding: 0;
   color: var(--text);
+  white-space: nowrap;
+}
+
+.step-text .when {
+  white-space: nowrap;
+}
+
+.step-text .when.warn {
+  white-space: normal;
+  color: var(--warn);
+}
+
+.step-text .then {
+  margin-top: -2px;
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+}
+
+.step-text .off {
+  font-size: 13px;
+}
+
+/* Now, or planning ahead */
+
+.when-row {
+  display: grid;
+  gap: 8px;
+  margin: -4px 0 14px;
+}
+
+.seg.seg3 {
+  grid-template-columns: repeat(3, 1fr);
+}
+
+.seg.seg3 button {
+  height: 30px;
+  font-size: 12.5px;
+}
+
+#trip-time {
+  width: 100%;
+  height: 40px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--fill);
+  color: var(--text);
+  font: inherit;
+  font-size: 14px;
+  font-variant-numeric: tabular-nums;
+  color-scheme: dark;
+}
+
+#trip-time:focus {
+  outline: 0;
+  border-color: var(--line-strong);
+  background: var(--fill-hover);
 }
 
 .pulse-dot {

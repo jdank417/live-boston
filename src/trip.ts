@@ -54,6 +54,8 @@ export interface Itinerary {
   legs: Leg[];
   /** Typical door-to-door time in seconds, from the model. */
   typical: number;
+  /** Found assuming a boat or train leaves soon; only real times can say. */
+  hopeful?: boolean;
 }
 
 /** An itinerary with real times. */
@@ -64,6 +66,8 @@ export interface Timed {
   arrive: number;
   /** Per leg: its start and end, and for rides the trip you'd take and the ones after. */
   legs: { start: number; end: number; run?: Run; later?: Run[]; guessed?: boolean }[];
+  /** A ride with no trips coming in the hours looked at (a ferry's midday gap, late at night). */
+  unavailable?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -189,18 +193,33 @@ export class TransitGraph {
    */
   plan(from: Place, to: Place): Itinerary[] {
     const out: Itinerary[] = [];
-    const seen = new Set<string>();
+    const seen = new Map<string, number>();
     const add = (it: Itinerary | null) => {
       if (!it) return;
       const key = it.legs.map((l) => (l.kind === 'ride' ? `${l.board.id}>${l.alight.id}` : 'w')).join('|');
-      if (seen.has(key)) return;
-      seen.add(key);
+      const i = seen.get(key);
+      // The same way found twice: keep the hopeful estimate, so it gets timed.
+      if (i !== undefined) {
+        if (it.typical < out[i].typical) out[i] = it;
+        return;
+      }
+      seen.set(key, out.length);
       out.push(it);
     };
     const first = this.search(from, to);
     first.forEach(add);
     const lead = out[0]?.legs.find((l): l is RideLeg => l.kind === 'ride');
     if (lead) this.search(from, to, new Set(lead.routes)).forEach(add);
+    // A genuinely different way: none of the best one's lines.
+    const used = new Set(out[0]?.legs.flatMap((l) => (l.kind === 'ride' ? l.routes : [])) ?? []);
+    if (used.size) this.search(from, to, used).forEach(add);
+    // Boats and commuter rail run every half hour or more, so on paper they
+    // lose to the subway. But when one is about to leave it can be the best
+    // way by far: try them as if one were, and let the real times decide.
+    this.search(from, to, undefined, true).forEach((it) => {
+      // Only ways that ride one of them are worth the hope.
+      if (it.legs.some((l) => l.kind === 'ride' && /^(CR-|Boat-)/.test(l.pattern.routeId))) add({ ...it, hopeful: true });
+    });
 
     // Close enough to walk.
     const [fx, fy] = toLocal(from.lng, from.lat);
@@ -212,12 +231,14 @@ export class TransitGraph {
       // Worth showing when it's not much slower than riding.
       if (walk.seconds < best * 1.6 || walk.seconds < 900) add({ legs: [walk], typical: walk.seconds });
     }
-    // Alternatives that take far longer only get in the way.
-    const fastest = Math.min(...out.map((o) => o.typical));
-    return out
-      .filter((o) => o.typical <= fastest * 1.35 + 120)
-      .sort((a, b) => a.typical - b.typical)
-      .slice(0, 3);
+    // Alternatives that take far longer only get in the way. Hopeful ones
+    // don't set the bar; the best of them rides along second, to be timed.
+    const sure = out.filter((o) => !o.hopeful).sort((a, b) => a.typical - b.typical);
+    const fastest = sure[0]?.typical ?? Infinity;
+    const hope = out.filter((o) => o.hopeful && o.typical < fastest).sort((a, b) => a.typical - b.typical)[0];
+    const kept = sure.filter((o) => o.typical <= fastest * 1.35 + 120);
+    if (!kept.length) return hope ? [hope] : [];
+    return [kept[0], ...(hope ? [hope] : []), ...kept.slice(1)].slice(0, 4);
   }
 
   private walk(from: Place, to: Place, crow?: number): WalkLeg {
@@ -239,7 +260,7 @@ export class TransitGraph {
   }
 
   /** Round-based search (RAPTOR): round k is the best you can do with k rides. */
-  private search(from: Place, to: Place, avoid?: Set<string>): Itinerary[] {
+  private search(from: Place, to: Place, avoid?: Set<string>, hopeful = false): Itinerary[] {
     type Label =
       | { t: number; how: 'access'; meters: number }
       | { t: number; how: 'ride'; seq: Seq; b: number; a: number }
@@ -285,7 +306,8 @@ export class TransitGraph {
       for (const [seq, start] of queue) {
         let board = -1;
         let boardT = Infinity;
-        const wait = (WAIT[seq.route.type] ?? 600) + (k > 1 ? TRANSFER : 0);
+        const usual = WAIT[seq.route.type] ?? 600;
+        const wait = (hopeful && (seq.route.type === 2 || seq.route.type === 4) ? 300 : usual) + (k > 1 ? TRANSFER : 0);
         for (let i = start; i < seq.stations.length; i++) {
           const id = seq.stations[i].id;
           if (board >= 0) {
@@ -409,13 +431,18 @@ function slice(track: Track, lo: number, hi: number): [number, number][] {
 /** A short cache, so the same leg asked twice in a few seconds is one request. */
 const runCache = new Map<string, { at: number; runs: Promise<Run[]> }>();
 
-export function runsFor(leg: RideLeg, maxAge = 20_000): Promise<Run[]> {
-  const key = `${leg.board.id}>${leg.alight.id}:${leg.routes.join(',')}`;
+/**
+ * Trips for a ride, soonest first. With a window (planning ahead), the
+ * timetable for then; otherwise live predictions from now.
+ */
+export function runsFor(leg: RideLeg, maxAge = 20_000, window?: { start: number; end: number }): Promise<Run[]> {
+  const span = window ? `@${Math.round(window.start / 600_000)}-${Math.round(window.end / 600_000)}` : '';
+  const key = `${leg.board.id}>${leg.alight.id}:${leg.routes.join(',')}${span}`;
   const hit = runCache.get(key);
   if (hit && Date.now() - hit.at < maxAge) return hit.runs;
   // Commuter rail and ferries only predict their next few trips; the timetable fills in.
   const sparse = leg.routes.some((id) => /^(CR-|Boat-)/.test(id));
-  const runs = loadRuns([leg.board.id, ...leg.board.children], [leg.alight.id, ...leg.alight.children], leg.routes, sparse);
+  const runs = loadRuns([leg.board.id, ...leg.board.children], [leg.alight.id, ...leg.alight.children], leg.routes, sparse, window);
   runCache.set(key, { at: Date.now(), runs });
   runs.catch(() => runCache.delete(key));
   return runs;
@@ -430,6 +457,7 @@ export function schedule(itin: Itinerary, runs: (Run[] | null)[], start: number)
   const legs: Timed['legs'] = [];
   let firstBoard: number | null = null;
   let walkBefore = 0;
+  let unavailable = false;
   itin.legs.forEach((leg, i) => {
     if (leg.kind === 'walk') {
       const end = t + leg.seconds * 1000;
@@ -447,6 +475,8 @@ export function schedule(itin: Itinerary, runs: (Run[] | null)[], start: number)
       if (firstBoard === null) firstBoard = run.board;
       t = alight;
     } else {
+      // The MBTA answered, and nothing runs: this way isn't on.
+      if (runs[i]) unavailable = true;
       // No trip known: allow the usual wait and ride.
       const board = ready + 4 * 60_000;
       legs.push({ start: board, end: board + leg.seconds * 1000, guessed: true });
@@ -461,7 +491,21 @@ export function schedule(itin: Itinerary, runs: (Run[] | null)[], start: number)
     const shift = leave - legs[0].start;
     legs[0] = { start: legs[0].start + shift, end: legs[0].end + shift };
   }
-  return { itin, leave, arrive: t, legs };
+  return { itin, leave, arrive: t, legs, unavailable };
+}
+
+/** Times an itinerary to arrive by `deadline`: the latest trains that still make it. */
+export function scheduleBy(itin: Itinerary, runs: (Run[] | null)[], deadline: number): Timed {
+  const first = itin.legs.findIndex((l) => l.kind === 'ride');
+  if (first < 0) return schedule(itin, runs, deadline - itin.legs.reduce((a, l) => a + l.seconds, 0) * 1000);
+  const before = itin.legs.slice(0, first).reduce((a, l) => a + l.seconds * 1000, 0) + (first > 0 ? PLATFORM : 0);
+  const options = (runs[first] ?? []).filter((r) => r.board <= deadline).sort((a, b) => b.board - a.board);
+  for (const r of options) {
+    const t = schedule(itin, runs, r.board - before);
+    if (t.arrive <= deadline) return t;
+  }
+  // No timetable that makes it: the usual time, ending at the deadline.
+  return schedule(itin, runs, deadline - itin.typical * 1000);
 }
 
 // ---------------------------------------------------------------------------

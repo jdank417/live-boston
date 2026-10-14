@@ -479,8 +479,20 @@ function pairUp(calls: Call[], from: Set<string>, stopOf: Map<Call, string>): Ru
   for (const c of calls) byTrip.set(c.trip, [...(byTrip.get(c.trip) ?? []), c]);
   const runs: Run[] = [];
   for (const [trip, cs] of byTrip) {
-    const a = cs.find((c) => from.has(stopOf.get(c)!));
-    const b = cs.find((c) => c !== a && !from.has(stopOf.get(c)!) && a && c.seq > a.seq);
+    // Loops (the harbor ferries) can call at a stop twice: board at the
+    // last call that still has the other stop after it, get off at the next.
+    cs.sort((x, y) => x.seq - y.seq);
+    let a: Call | undefined;
+    let b: Call | undefined;
+    for (const c of cs) {
+      if (from.has(stopOf.get(c)!)) a = c;
+      else if (a && !b) b = c;
+    }
+    if (a && b && b.seq < a.seq) b = undefined;
+    if (!a || !b) {
+      a = cs.find((c) => from.has(stopOf.get(c)!));
+      b = a && cs.find((c) => !from.has(stopOf.get(c)!) && c.seq > a!.seq);
+    }
     if (!a || !b) continue;
     const board = Number.isNaN(a.dep) ? a.arr : a.dep;
     if (Number.isNaN(board)) continue;
@@ -498,19 +510,39 @@ function pairUp(calls: Call[], from: Set<string>, stopOf: Map<Call, string>): Ru
 }
 
 const bostonTime = new Intl.DateTimeFormat('en-GB', { timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
+const bostonDate = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit' });
+
+/** The timetable's terms for a span of time: its date, and the times on it (past midnight runs on as 24:xx). */
+function timetableSpan(start: number, end: number) {
+  const date = bostonDate.format(start);
+  const min = bostonTime.format(start);
+  let max = bostonTime.format(end);
+  if (bostonDate.format(end) !== date) max = `${String(Math.min(27, 24 + Number(max.slice(0, 2)))).padStart(2, '0')}${max.slice(2)}`;
+  return { date, min, max };
+}
 
 /**
  * Trips on these routes from one station to another, soonest first: live
  * predictions, topped up from the timetable when asked (commuter rail and
  * ferries only predict the next few) or when nothing is predicted.
  */
-export async function loadRuns(from: string[], to: string[], routeIds: string[], timetable: boolean): Promise<Run[]> {
+export async function loadRuns(
+  from: string[],
+  to: string[],
+  routeIds: string[],
+  timetable: boolean,
+  window?: { start: number; end: number },
+): Promise<Run[]> {
   const fromSet = new Set(from);
   const stops = [...from, ...to].join(',');
   const routes = routeIds.join(',');
   const now = Date.now();
+  // Planning ahead, past what predictions cover: the timetable alone.
+  const ahead = !!window && window.start > now + 20 * 60_000;
+  const since = window ? Math.max(window.start, ahead ? 0 : now - 30_000) : now - 30_000;
+  const until = window?.end ?? now + 6 * 3_600_000;
 
-  const pdoc = await get('/predictions', {
+  const pdoc = ahead ? { data: [], included: [] } : await get('/predictions', {
     'filter[stop]': stops,
     'filter[route]': routes,
     include: 'trip',
@@ -537,18 +569,18 @@ export async function loadRuns(from: string[], to: string[], routeIds: string[],
     stopOf.set(c, rel(p, 'stop') ?? '');
     calls.push(c);
   }
-  let runs = pairUp(calls, fromSet, stopOf).filter((r) => r.board > now - 30_000);
+  let runs = pairUp(calls, fromSet, stopOf).filter((r) => r.board > since);
 
-  if ((timetable && runs.length < 3) || !runs.length) {
-    // The timetable, for the next few hours. Late at night "now" may already
-    // be past the last trip; that just returns nothing.
-    const min = bostonTime.format(now);
-    const max = bostonTime.format(now + 4 * 3_600_000);
+  if (ahead || (timetable && runs.length < 3) || !runs.length) {
+    // The timetable, for the next few hours (or the window asked about).
+    // Arrivals can come well after the last departure asked about.
+    const span = timetableSpan(since, until + 2 * 3_600_000);
     const sdoc = await get('/schedules', {
       'filter[stop]': stops,
       'filter[route]': routes,
-      'filter[min_time]': min,
-      ...(max > min ? { 'filter[max_time]': max } : {}),
+      'filter[date]': span.date,
+      'filter[min_time]': span.min,
+      'filter[max_time]': span.max,
       include: 'trip',
       'fields[schedule]': 'arrival_time,departure_time,stop_sequence',
       'fields[trip]': 'headsign',
@@ -571,7 +603,7 @@ export async function loadRuns(from: string[], to: string[], routeIds: string[],
       scalls.push(c);
     }
     const predicted = new Set(runs.map((r) => r.tripId));
-    runs = runs.concat(pairUp(scalls, fromSet, stopOf).filter((r) => !predicted.has(r.tripId) && r.board > now - 30_000));
+    runs = runs.concat(pairUp(scalls, fromSet, stopOf).filter((r) => !predicted.has(r.tripId) && r.board > since && r.board <= until));
   }
   return runs.sort((a, b) => a.board - b.board);
 }

@@ -35,6 +35,7 @@ import {
   routeWalks,
   runsFor,
   schedule,
+  scheduleBy,
   searchPlaces,
   TransitGraph,
   typeaheadUp,
@@ -2921,7 +2922,7 @@ function focusGroup(id: string) {
 
 sheetEl.addEventListener('click', (e) => {
   const el = (e.target as HTMLElement).closest<HTMLElement>(
-    '[data-tab],[data-toggle],[data-show-alerts],[data-focus],[data-layer],[data-view],[data-action],[data-train],[data-unfollow],[data-alert-map],[data-open-alert],[data-trip],[data-trip-pick],[data-trip-choose],[data-result]',
+    '[data-tab],[data-toggle],[data-show-alerts],[data-focus],[data-layer],[data-view],[data-action],[data-train],[data-unfollow],[data-alert-map],[data-open-alert],[data-trip],[data-trip-pick],[data-trip-choose],[data-trip-when],[data-result]',
   );
   // The sheet carries its own data-tab; a click on nothing in particular isn't a tab.
   if (!el || el === sheetEl) return;
@@ -2955,7 +2956,8 @@ sheetEl.addEventListener('click', (e) => {
     openAlerts.add(d.openAlert);
     renderMain();
     mainEl.querySelector(`[data-alert="${CSS.escape(d.openAlert)}"]`)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
-  } else if (d.trip) tripAction(d.trip, el);
+  } else if (d.tripWhen) setWhen(d.tripWhen as When['mode']);
+  else if (d.trip) tripAction(d.trip, el);
   else if (d.tripPick) {
     const p = placeResults[Number(d.tripPick)];
     if (p) pickPlace(p.kind === 'here' ? null : { name: p.name, detail: p.detail, lng: p.lng, lat: p.lat, stationId: p.stationId });
@@ -3226,14 +3228,22 @@ interface TripState {
   busy: boolean;
   /** They chose a way themselves; times refreshing shouldn't switch it. */
   picked: boolean;
+  /** Going now, or planning ahead: leaving at, or arriving by, a time. */
+  when: When;
 }
+
+interface When {
+  mode: 'now' | 'leave' | 'arrive';
+  at: number;
+}
+const NOW: When = { mode: 'now', at: 0 };
 let trip: TripState = blankTrip();
 /** Directions are open, or set aside while looking at a train or station on the way. */
 let tripActive = false;
 let planSeq = 0;
 
 function blankTrip(): TripState {
-  return { from: null, to: null, editing: null, origin: null, plans: null, timed: null, chosen: null, status: null, busy: false, picked: false };
+  return { from: null, to: null, editing: null, origin: null, plans: null, timed: null, chosen: null, status: null, busy: false, picked: false, when: NOW };
 }
 
 const planKey = (it: Itinerary) => it.legs.map((l) => (l.kind === 'ride' ? `${l.board.id}>${l.alight.id}` : 'w')).join('|');
@@ -3260,7 +3270,8 @@ function nearestStation(p: { lng: number; lat: number }) {
 /** Opens directions, to a place if one is given (otherwise it asks where to). */
 function openTrip(to: Place | null = null, from: Place | null = null) {
   stopPreview();
-  trip = { ...blankTrip(), to, from, editing: to ? null : 'to' };
+  // Planning ahead carries over to the next search.
+  trip = { ...blankTrip(), to, from, editing: to ? null : 'to', when: trip.when };
   tripActive = true;
   closeSearch();
   if (selection?.kind === 'trip') renderDetail();
@@ -3342,11 +3353,19 @@ async function planTrip(keepView = false) {
 }
 
 /** Times one way, leg by leg; a leg the MBTA won't answer for gets a usual wait. */
-async function timePlan(p: Itinerary, maxAge: number) {
+async function timePlan(p: Itinerary, maxAge: number, when: When = NOW) {
+  // Planning ahead: the timetable around then, which doesn't change by the minute.
+  const span = p.typical * 1000;
+  const window =
+    when.mode === 'leave'
+      ? { start: when.at, end: when.at + span + 3 * 3_600_000 }
+      : when.mode === 'arrive'
+        ? { start: when.at - span - 2.5 * 3_600_000, end: when.at }
+        : undefined;
   const runs = await Promise.all(
     p.legs.map((l) =>
       l.kind === 'ride'
-        ? runsFor(l, maxAge).catch((err) => {
+        ? runsFor(l, window ? 600_000 : maxAge, window).catch((err) => {
             if (err instanceof RateLimited) handleError(err, '');
             else console.warn(err);
             return null;
@@ -3354,7 +3373,14 @@ async function timePlan(p: Itinerary, maxAge: number) {
         : null,
     ),
   );
-  return schedule(p, runs, Date.now());
+  if (when.mode === 'arrive') return scheduleBy(p, runs, when.at);
+  return schedule(p, runs, when.mode === 'leave' ? when.at : Date.now());
+}
+
+/** Best first: soonest there (or, arriving by a time, leaving latest); ways not running last. */
+function byBest(when: When) {
+  return (a: Timed, b: Timed) =>
+    Number(!!a.unavailable) - Number(!!b.unavailable) || (when.mode === 'arrive' ? b.leave - a.leave || a.arrive - b.arrive : a.arrive - b.arrive);
 }
 
 let altsTimedAt = 0;
@@ -3369,7 +3395,8 @@ async function timeTrip(seq = planSeq) {
   if (!t.plans?.length) return;
   t.busy = true;
   const chosen = chosenPlan(t) ?? t.plans[0];
-  const first = await timePlan(chosen, 25_000);
+  const when = t.when;
+  const first = await timePlan(chosen, 25_000, when);
   if (seq !== planSeq) return;
   const others = t.plans.filter((p) => p !== chosen);
   const fresh = Date.now() - altsTimedAt > 90_000 || !t.timed || t.timed.length < t.plans.length;
@@ -3378,20 +3405,23 @@ async function timeTrip(seq = planSeq) {
     rest = [];
     // One at a time, so a burst doesn't hit the limit.
     for (const p of others) {
-      rest.push(await timePlan(p, 90_000));
+      rest.push(await timePlan(p, 90_000, when));
       if (seq !== planSeq) return;
     }
     altsTimedAt = Date.now();
   } else rest = (t.timed ?? []).filter((x) => others.includes(x.itin));
-  t.timed = [first, ...rest].sort((a, b) => a.arrive - b.arrive);
+  if (when !== t.when) return;
+  // A way with nothing running drops out, unless nothing else does.
+  const all = [first, ...rest].sort(byBest(when));
+  t.timed = all.some((x) => !x.unavailable) ? all.filter((x) => !x.unavailable || planKey(x.itin) === t.chosen) : all;
   t.busy = false;
-  // The first time, pick the soonest arrival; after that, keep their choice.
-  if (!t.picked) t.chosen = planKey(t.timed[0].itin);
+  // The first time, pick the best; after that, keep their choice.
+  if (!t.picked || !t.timed.some((x) => planKey(x.itin) === t.chosen)) t.chosen = planKey(t.timed[0].itin);
   if (t === trip && selection?.kind === 'trip') {
     renderTripPanel();
     drawTrip();
   }
-  if (commute && samePlace(t.to, commuteTarget()?.to ?? null) && !t.from) shareWithCommute(t);
+  if (when.mode === 'now' && commute && samePlace(t.to, commuteTarget()?.to ?? null) && !t.from) shareWithCommute(t);
 }
 
 function chosenTimed(t = trip) {
@@ -3405,7 +3435,7 @@ async function refreshTrip() {
   const t = trip;
   if (!t.to || !t.plans) return;
   // On the move: plan again from where you are now.
-  if (!t.from && me && t.origin && meters(me, t.origin) > 150) {
+  if (!t.from && t.when.mode === 'now' && me && t.origin && meters(me, t.origin) > 150) {
     planTrip(true);
     return;
   }
@@ -3596,6 +3626,29 @@ function lineName(r: Route | undefined) {
   return r.type === 2 ? `${r.name.replace(/ Line$/, '')} Line` : r.name;
 }
 
+/** "12:08", for times beside one that already says AM or PM. */
+const shortClock = (at: number) => clockFmt.format(at).replace(/\s?[AP]M$/, '');
+
+const dayFmt = new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', weekday: 'short', month: 'short', day: 'numeric' });
+const dayKey = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York' });
+/** "Today", "Tomorrow" or "Thu, Oct 16". */
+function dayLabel(at: number) {
+  const d = dayKey.format(at);
+  if (d === dayKey.format(Date.now())) return 'Today';
+  if (d === dayKey.format(Date.now() + 86_400_000)) return 'Tomorrow';
+  return dayFmt.format(at);
+}
+
+/** Two or three characters for a line, for its badge: RL, OL, GL·C, SL1, CR. */
+function lineBadge(r: Route | undefined) {
+  if (!r) return 'T';
+  if (r.id.startsWith('Green-')) return `GL·${r.id.slice(6)}`;
+  if (r.type === 3) return r.short;
+  if (r.type === 2) return 'CR';
+  if (r.type === 4) return r.short && r.short.length <= 3 ? r.short : 'F';
+  return { Red: 'RL', Orange: 'OL', Blue: 'BL', Mattapan: 'M' }[r.id] ?? r.short.slice(0, 3);
+}
+
 function leaveText(at: number) {
   const s = (at - Date.now()) / 1000;
   if (s <= 60) return 'now';
@@ -3611,10 +3664,12 @@ function journeyBar(it: Itinerary, tm: Timed | null) {
   const total = durs.reduce((a, b) => a + b, 0);
   return `<div class="journey" aria-hidden="true">${it.legs
     .map((l, i) => {
-      const grow = Math.max(0.08, durs[i] / total);
+      const grow = Math.max(0.1, durs[i] / total);
       if (l.kind === 'walk') return `<span class="seg-walk" style="flex:${grow}">${ICON.walk}</span>`;
       const r = legRoute(l, tm?.legs[i].run);
-      return `<span class="seg-ride" style="flex:${grow};--c:${r ? displayColor(r.color) : '#777'}">${escape(lineShort(r))}</span>`;
+      // The full name when there's room, the badge when there isn't.
+      const name = grow > 0.24 ? lineShort(r) : lineBadge(r);
+      return `<span class="seg-ride" style="flex:${grow};--c:${r ? displayColor(r.color) : '#777'}" title="${escape(lineName(r))}">${escape(name)}</span>`;
     })
     .join('')}</div>`;
 }
@@ -3623,7 +3678,7 @@ function journeyBar(it: Itinerary, tm: Timed | null) {
 function liveTrainNote(run?: Run) {
   const t = run?.vehicleId ? trains.get(run.vehicleId) : undefined;
   if (!t) return '';
-  return `<button class="live-train" data-trip="watch" data-vehicle="${escape(t.v.id)}"><span class="pulse-dot"></span>${statusLine(t)} now<span class="link">Watch it</span></button>`;
+  return `<button class="live-train" data-trip="watch" data-vehicle="${escape(t.v.id)}"><span class="pulse-dot"></span><span class="live-where">${statusLine(t)} now</span><span class="link">Watch it</span></button>`;
 }
 
 function stepsHtml(it: Itinerary, tm: Timed | null) {
@@ -3647,21 +3702,24 @@ function stepsHtml(it: Itinerary, tm: Timed | null) {
     const ride = x ? (x.end - x.start) / 1000 : leg.seconds;
     let when = '';
     if (run) {
-      const later = x?.later?.length ? ` · then ${x.later.map((l) => clockFmt.format(l.board)).join(', ')}` : '';
-      when = `<small class="when">Departs <b>${clockFmt.format(run.board)}</b> ${run.live ? '<em class="live">live</em>' : '<em>scheduled</em>'}${later}</small>`;
+      const later = x?.later?.length ? `<small class="then">Then ${x.later.map((l) => shortClock(l.board)).join(', ')}</small>` : '';
+      when = `<small class="when">Departs <b>${clockFmt.format(run.board)}</b>${run.live ? '<em class="live">live</em>' : '<em>scheduled</em>'}</small>${later}`;
     } else if (x?.guessed) {
-      when = '<small class="when">No times posted right now; allowing a usual wait</small>';
+      when = tm?.unavailable
+        ? '<small class="when warn">None running in the hours looked at</small>'
+        : '<small class="when">No times posted; allowing a usual wait</small>';
     } else when = '<small class="when">Checking times…</small>';
     const other = leg.routes.length > 1 && r?.type !== 2 ? `<small>Any ${escape(lineShort(r).split(' ')[0])} train toward ${escape(toward)} works</small>` : '';
     rows.push(`<li class="step ride" style="--c:${color}">
-      <span class="step-icon line">${escape(lineShort(r))}</span>
+      <span class="step-icon line">${escape(lineBadge(r))}</span>
       <div class="step-text">
         <strong>${escape(lineName(r))} <span>to ${escape(toward)}</span></strong>
         <small>Board at ${escape(leg.board.name)}</small>
         ${when}
-        ${liveTrainNote(run)}
+        ${trip.when.mode === 'now' ? liveTrainNote(run) : ''}
         ${other}
-        <small class="ride-len">Ride ${leg.stops} stop${leg.stops === 1 ? '' : 's'} · ${fmtMins(ride)} · off at <b>${escape(leg.alight.name)}</b></small>
+        <small class="ride-len">${leg.stops} stop${leg.stops === 1 ? '' : 's'} · ${fmtMins(ride)}</small>
+        <small class="off">Get off at <b>${escape(leg.alight.name)}</b></small>
       </div>
       ${x ? `<time>${clockFmt.format(x.start)}</time>` : ''}
     </li>`);
@@ -3691,7 +3749,7 @@ function odRow(which: 'from' | 'to') {
   </button>`;
 }
 
-function renderTrip() {
+function renderTrip(target: HTMLElement = detailEl) {
   detailEl.style.setProperty('--c', '#3b82f6');
   const t = trip;
   const plan = chosenPlan();
@@ -3706,10 +3764,16 @@ function renderTrip() {
   } else if (plan) {
     const walkOnly = plan.legs.length === 1 && plan.legs[0].kind === 'walk';
     const leave = tm ? tm.leave : null;
-    const soon = leave !== null && leave - Date.now() <= 60_000;
+    const ahead = t.when.mode !== 'now';
+    const soon = !ahead && leave !== null && leave - Date.now() <= 60_000;
+    const length = tm ? fmtMins((tm.arrive - tm.leave) / 1000) : `about ${fmtMins(plan.typical)}`;
+    // Planning ahead: clock times and the day. Going now: a countdown.
+    const leaveBox = ahead
+      ? `<small>Leave</small><b>${leave !== null ? clockFmt.format(leave) : '…'}</b><span>${leave !== null ? dayLabel(leave) : ''}</span>`
+      : `<small>${walkOnly ? 'Walk' : 'Leave'}${leave !== null && !soon ? ' in' : ''}</small><b data-leave="${leave ?? ''}">${leave !== null ? leaveText(leave) : '…'}</b>`;
     const summary = `<div class="trip-sum${soon ? ' go' : ''}">
-        <div class="trip-leave"><small>${walkOnly ? 'Walk' : 'Leave'}${leave !== null && !soon ? ' in' : ''}</small><b data-leave="${leave ?? ''}">${leave !== null ? leaveText(leave) : '…'}</b></div>
-        <div class="trip-arrive"><small>Arrive</small><b>${tm ? clockFmt.format(tm.arrive) : '…'}</b><span>${tm ? fmtMins((tm.arrive - tm.leave) / 1000) : `about ${fmtMins(plan.typical)}`}</span></div>
+        <div class="trip-leave">${leaveBox}</div>
+        <div class="trip-arrive"><small>Arrive</small><b>${tm ? clockFmt.format(tm.arrive) : '…'}</b><span>${length}</span></div>
       </div>`;
     const others = (t.timed ?? t.plans!.map((p) => ({ itin: p }) as Timed)).filter((x) => planKey(x.itin) !== t.chosen);
     const alt = others.length
@@ -3719,7 +3783,13 @@ function renderTrip() {
             const via = rides.length ? rides.map((l) => lineShort(legRoute(l, o.legs?.[o.itin.legs.indexOf(l)]?.run))).join(' → ') : 'Walk all the way';
             return `<li style="--i:${i}"><button class="card alt" data-trip-choose="${escape(planKey(o.itin))}">
               <span class="card-text"><strong>${escape(via)}</strong>${journeyBar(o.itin, o.leave ? o : null)}</span>
-              <span class="card-side">${o.arrive ? `<b>${clockFmt.format(o.arrive)}</b><small>leave ${leaveText(o.leave) === 'now' ? 'now' : `in ${leaveText(o.leave)}`}</small>` : `<b>${fmtMins(o.itin.typical)}</b>`}</span>
+              <span class="card-side">${
+                o.arrive
+                  ? `<b>${clockFmt.format(o.arrive)}</b><small>${
+                      o.unavailable ? 'not running' : t.when.mode !== 'now' ? `leave ${clockFmt.format(o.leave)}` : leaveText(o.leave) === 'now' ? 'leave now' : `leave in ${leaveText(o.leave)}`
+                    }</small>`
+                  : `<b>${fmtMins(o.itin.typical)}</b>`
+              }</span>
             </button></li>`;
           })
           .join('')}</ul>`
@@ -3746,7 +3816,7 @@ function renderTrip() {
       <p class="fine">${t.busy && !tm ? 'Getting live times… · ' : ''}Live MBTA predictions, or the timetable where there are none. Walking routes from OpenStreetMap.</p>`;
   }
 
-  detailEl.innerHTML = `
+  target.innerHTML = `
     ${detailNav()}
     <div class="hero">
       <p class="eyebrow"><span class="dot"></span>Directions</p>
@@ -3757,18 +3827,68 @@ function renderTrip() {
       ${odRow('to')}
       ${t.to && !t.editing ? `<button class="icon-btn subtle od-swap" data-trip="swap" aria-label="Swap start and destination" title="Swap">${ICON.swap}</button>` : ''}
     </div>
-    ${body}`;
+    ${t.editing ? '' : whenHtml()}
+    <div id="trip-body">${body}</div>`;
   if (t.editing) {
     if (!placeResults.length && !placeQuery) suggestPlaces('');
     else renderPlaceResults();
   }
 }
 
+/** The datetime-local value for a moment, in this device's time zone. */
+function localInput(at: number) {
+  const d = new Date(at - new Date(at).getTimezoneOffset() * 60_000);
+  return d.toISOString().slice(0, 16);
+}
+
+/** Now, or planning ahead: leave at or arrive by a day and time. */
+function whenHtml() {
+  const w = trip.when;
+  const opt = (mode: When['mode'], label: string) =>
+    `<button role="radio" aria-checked="${w.mode === mode}" data-trip-when="${mode}">${label}</button>`;
+  return `<div class="when-row">
+    <div class="seg seg3" role="radiogroup" aria-label="When">${opt('now', 'Now')}${opt('leave', 'Leave at')}${opt('arrive', 'Arrive by')}</div>
+    ${w.mode === 'now' ? '' : `<input id="trip-time" type="datetime-local" value="${localInput(w.at)}" min="${localInput(Date.now() - 3_600_000)}" aria-label="${w.mode === 'leave' ? 'Leave at' : 'Arrive by'}" />`}
+  </div>`;
+}
+
+function setWhen(mode: When['mode'], at?: number) {
+  const prev = trip.when;
+  if (mode === 'now') trip.when = NOW;
+  else {
+    // A sensible start: the time already picked, else the next quarter hour (or an hour on, to arrive by).
+    const base = at ?? (prev.mode !== 'now' ? prev.at : Date.now() + (mode === 'arrive' ? 3_600_000 : 900_000));
+    trip.when = { mode, at: Math.round(base / 300_000) * 300_000 };
+  }
+  trip.picked = false;
+  trip.timed = null;
+  altsTimedAt = 0;
+  renderTripPanel();
+  if (trip.plans) timeTrip();
+  else if (trip.to) planTrip();
+}
+
+detailEl.addEventListener('change', (e) => {
+  const el = e.target as HTMLInputElement;
+  if (el.id !== 'trip-time' || !el.value || trip.when.mode === 'now') return;
+  const at = new Date(el.value).getTime();
+  if (Number.isFinite(at)) setWhen(trip.when.mode, at);
+});
+
 /** Re-renders the trip panel unless someone is typing in it. */
 function renderTripPanel() {
   if (selection?.kind !== 'trip') return;
   const input = detailEl.querySelector<HTMLInputElement>('#trip-input');
   if (trip.editing && input && document.activeElement === input) return;
+  // While a time is being picked, only what's below the picker changes.
+  if (document.activeElement?.id === 'trip-time') {
+    const holder = document.createElement('div');
+    renderTrip(holder);
+    const fresh = holder.querySelector('#trip-body');
+    const body = detailEl.querySelector('#trip-body');
+    if (fresh && body) body.replaceWith(fresh);
+    return;
+  }
   const scroll = detailEl.scrollTop;
   renderDetail();
   detailEl.scrollTop = scroll;
@@ -4032,7 +4152,7 @@ function saveCommute() {
 /** The open trip answers the commute card too, saving requests. */
 function shareWithCommute(t: TripState) {
   if (!commute || !t.plans || !t.to || !t.origin) return;
-  const timed = t.timed?.[0] ?? null;
+  const timed = t.timed?.find((x) => !x.unavailable) ?? null;
   const back = samePlace(t.to, commute.home) && !samePlace(t.to, commute.to);
   commuteState = { to: t.to, from: t.origin, back, plans: t.plans, timed, at: Date.now() };
   renderCommute();
@@ -4066,7 +4186,7 @@ async function refreshCommute() {
     // The best two ways, timed (the second less often); the soonest arrival wins.
     const timed: Timed[] = [];
     for (const [i, p] of st.plans.slice(0, 2).entries()) timed.push(await timePlan(p, i ? 180_000 : 25_000));
-    if (commuteState === st) st.timed = timed.sort((a, b) => a.arrive - b.arrive)[0] ?? null;
+    if (commuteState === st) st.timed = timed.sort(byBest(NOW))[0] ?? null;
   } catch (err) {
     if (err instanceof RateLimited) handleError(err, '');
     else console.warn(err);
@@ -4122,7 +4242,7 @@ function renderCommute() {
         side = `<small>Leave in</small><b>${leaveIn >= 3_600_000 ? clockFmt.format(tm.leave) : `${m}<i>min</i>`}</b>`;
         state = m <= 5 ? ' soon' : '';
       }
-      line = `Arrive ${clockFmt.format(tm.arrive)}${run && ride ? ` · ${lineShort(route)} at ${clockFmt.format(run.board)} from ${ride.board.name}` : ''}`;
+      line = `Arrive ${clockFmt.format(tm.arrive)}${run && ride ? ` · ${lineShort(route)} at ${shortClock(run.board)}` : ''}`;
     }
     html = `<span class="card-bar"></span>
       <span class="commute-text">
