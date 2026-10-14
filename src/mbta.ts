@@ -405,3 +405,173 @@ export async function loadAlerts(routeIds: string[]): Promise<Alert[]> {
     };
   });
 }
+
+// ---------------------------------------------------------------------------
+// Trip planning: the stops each service pattern makes, and when trips run
+// between two stations.
+
+export interface Pattern {
+  id: string;
+  routeId: string;
+  directionId: number;
+  headsign: string;
+  shapeId?: string;
+  /** Its stops in order, as platform ids. */
+  stops: string[];
+}
+
+/** The regular service patterns of these routes, with their stops in order. */
+export async function loadPatterns(routeIds: string[]): Promise<Pattern[]> {
+  const doc = await get('/route_patterns', {
+    'filter[route]': routeIds.join(','),
+    include: 'representative_trip.stops',
+    'fields[route_pattern]': 'typicality,direction_id',
+    'fields[trip]': 'headsign,shape',
+    'fields[stop]': 'name',
+  });
+  const trips = index(doc, 'trip');
+  const out: Pattern[] = [];
+  for (const p of doc.data) {
+    // 1 typical, 2 a regular variant; the rest are rare, detours or diagrams.
+    if (p.attributes.typicality > 2) continue;
+    const trip = trips.get(rel(p, 'representative_trip') ?? '');
+    const stops = (trip?.relationships?.stops?.data as unknown as { id: string }[] | undefined)?.map((s) => s.id);
+    const routeId = rel(p, 'route');
+    if (!trip || !routeId || !stops?.length) continue;
+    out.push({
+      id: p.id,
+      routeId,
+      directionId: p.attributes.direction_id,
+      headsign: trip.attributes.headsign ?? '',
+      shapeId: rel(trip, 'shape'),
+      stops,
+    });
+  }
+  return out;
+}
+
+/** One trip that stops at a station and later at another. */
+export interface Run {
+  tripId: string;
+  routeId: string;
+  headsign: string;
+  /** Epoch ms it leaves the first station and reaches the second (NaN if unknown). */
+  board: number;
+  alight: number;
+  vehicleId?: string;
+  /** From a live prediction rather than the timetable. */
+  live: boolean;
+}
+
+interface Call {
+  trip: string;
+  route: string;
+  seq: number;
+  dep: number;
+  arr: number;
+  vehicle?: string;
+  live: boolean;
+  headsign?: string;
+}
+
+function pairUp(calls: Call[], from: Set<string>, stopOf: Map<Call, string>): Run[] {
+  const byTrip = new Map<string, Call[]>();
+  for (const c of calls) byTrip.set(c.trip, [...(byTrip.get(c.trip) ?? []), c]);
+  const runs: Run[] = [];
+  for (const [trip, cs] of byTrip) {
+    const a = cs.find((c) => from.has(stopOf.get(c)!));
+    const b = cs.find((c) => c !== a && !from.has(stopOf.get(c)!) && a && c.seq > a.seq);
+    if (!a || !b) continue;
+    const board = Number.isNaN(a.dep) ? a.arr : a.dep;
+    if (Number.isNaN(board)) continue;
+    runs.push({
+      tripId: trip,
+      routeId: a.route,
+      headsign: a.headsign ?? b.headsign ?? '',
+      board,
+      alight: Number.isNaN(b.arr) ? b.dep : b.arr,
+      vehicleId: a.vehicle ?? b.vehicle,
+      live: a.live,
+    });
+  }
+  return runs;
+}
+
+const bostonTime = new Intl.DateTimeFormat('en-GB', { timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
+
+/**
+ * Trips on these routes from one station to another, soonest first: live
+ * predictions, topped up from the timetable when asked (commuter rail and
+ * ferries only predict the next few) or when nothing is predicted.
+ */
+export async function loadRuns(from: string[], to: string[], routeIds: string[], timetable: boolean): Promise<Run[]> {
+  const fromSet = new Set(from);
+  const stops = [...from, ...to].join(',');
+  const routes = routeIds.join(',');
+  const now = Date.now();
+
+  const pdoc = await get('/predictions', {
+    'filter[stop]': stops,
+    'filter[route]': routes,
+    include: 'trip',
+    'fields[prediction]': 'arrival_time,departure_time,stop_sequence,schedule_relationship',
+    'fields[trip]': 'headsign',
+  });
+  const ptrips = index(pdoc, 'trip');
+  const stopOf = new Map<Call, string>();
+  const calls: Call[] = [];
+  for (const p of pdoc.data) {
+    if (p.attributes.schedule_relationship === 'SKIPPED' || p.attributes.schedule_relationship === 'CANCELLED') continue;
+    const trip = rel(p, 'trip');
+    if (!trip) continue;
+    const c: Call = {
+      trip,
+      route: rel(p, 'route') ?? '',
+      seq: p.attributes.stop_sequence,
+      dep: time(p.attributes.departure_time),
+      arr: time(p.attributes.arrival_time),
+      vehicle: rel(p, 'vehicle'),
+      live: true,
+      headsign: ptrips.get(trip)?.attributes.headsign,
+    };
+    stopOf.set(c, rel(p, 'stop') ?? '');
+    calls.push(c);
+  }
+  let runs = pairUp(calls, fromSet, stopOf).filter((r) => r.board > now - 30_000);
+
+  if ((timetable && runs.length < 3) || !runs.length) {
+    // The timetable, for the next few hours. Late at night "now" may already
+    // be past the last trip; that just returns nothing.
+    const min = bostonTime.format(now);
+    const max = bostonTime.format(now + 4 * 3_600_000);
+    const sdoc = await get('/schedules', {
+      'filter[stop]': stops,
+      'filter[route]': routes,
+      'filter[min_time]': min,
+      ...(max > min ? { 'filter[max_time]': max } : {}),
+      include: 'trip',
+      'fields[schedule]': 'arrival_time,departure_time,stop_sequence',
+      'fields[trip]': 'headsign',
+    });
+    const strips = index(sdoc, 'trip');
+    const scalls: Call[] = [];
+    for (const s of sdoc.data) {
+      const trip = rel(s, 'trip');
+      if (!trip) continue;
+      const c: Call = {
+        trip,
+        route: rel(s, 'route') ?? '',
+        seq: s.attributes.stop_sequence,
+        dep: time(s.attributes.departure_time),
+        arr: time(s.attributes.arrival_time),
+        live: false,
+        headsign: strips.get(trip)?.attributes.headsign,
+      };
+      stopOf.set(c, rel(s, 'stop') ?? '');
+      scalls.push(c);
+    }
+    const predicted = new Set(runs.map((r) => r.tripId));
+    runs = runs.concat(pairUp(scalls, fromSet, stopOf).filter((r) => !predicted.has(r.tripId) && r.board > now - 30_000));
+  }
+  return runs.sort((a, b) => a.board - b.board);
+}

@@ -22,9 +22,16 @@ Boston in real time: every T, commuter rail, Silver Line, ferry and Amtrak train
   **bunched trains** running nose to tail are worked out from live positions
 - **Search** stations, lines, any train by number, ferries by name and
   Bluebikes docks. Press `/` on a keyboard
-- **My commute**: pin a departure from any station and the top of the sidebar
-  counts down to when you need to leave, allowing for your walk, with an
-  optional reminder while the app is open
+- **Where to?** Directions from where you are (by GPS) or anywhere, to any
+  station, address or place, or a spot you tap on the map. The trip is drawn
+  on the map: the real way on foot, the real track for each ride. Each step
+  has live times: which train to catch, where it is right now (tap to watch
+  it come), how many stops, and where to get off. **Preview the trip** flies
+  the camera along the whole route in 3D. Other ways are listed beside the
+  fastest, and "Directions here" on any station starts one
+- **My commute**: save a trip and the top of the sidebar counts down to when
+  to leave, timed from where you are now. At the far end it turns around for
+  the way back. There's an optional reminder while the app is open
 - **Installable**: add it to your home screen as an app, with rich link previews
 - **Ride along** steps the interface aside and follows a train with a minimal
   panel (tap the line's name for the stops ahead), or switch to the **cab
@@ -72,7 +79,12 @@ typical locomotive and six coaches, and the panel says so.
 ## How it works
 
 It's a static site with no backend. The browser pulls live data straight from
-the [MBTA V3 API](https://api-v3.mbta.com) every 12 seconds. The map is
+the [MBTA V3 API](https://api-v3.mbta.com) every 12 seconds.
+Directions are found in the browser on the MBTA's own trip patterns, then
+timed with its live predictions (or timetable). Walking routes come from
+[Valhalla](https://valhalla.github.io/valhalla/) on OpenStreetMap's public
+server, and addresses from [Photon](https://photon.komoot.io), falling back
+to [Nominatim](https://nominatim.org) when it's down. The map is
 [MapLibre GL](https://maplibre.org) on [OpenFreeMap](https://openfreemap.org)
 tiles with buildings extruded from OpenStreetMap heights, and the trains are
 drawn with [three.js](https://threejs.org) in a custom layer that shares the
@@ -96,6 +108,5 @@ Pushes to `main` build and deploy to GitHub Pages through
 
 ## Roadmap
 
-- Pin a station for a live countdown and a "leave now" alert
-- Service alerts on the map
-- Ferries
+- Plan ahead: leave at or arrive by a chosen time
+- Account for service alerts (suspensions, shuttles) when picking a route

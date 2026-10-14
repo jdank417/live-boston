@@ -11,6 +11,7 @@ import {
   loadAlerts,
   loadDepartures,
   loadNetwork,
+  loadPatterns,
   loadStations,
   loadUpcomingStops,
   loadVehicles,
@@ -19,6 +20,7 @@ import {
   type Departure,
   type Network,
   type Route,
+  type Run,
   type Station,
   type UpcomingStop,
   type Vehicle,
@@ -29,6 +31,18 @@ import { isPhone, Sheet } from './sheet';
 import { blend, SKY, skyAt, sunTimes, type SkyState } from './sky';
 import { SPEED_SCALE, SpeedMap } from './speedmap';
 import { TrainLayer, type Car } from './trains3d';
+import {
+  routeWalks,
+  runsFor,
+  schedule,
+  searchPlaces,
+  TransitGraph,
+  typeaheadUp,
+  type Itinerary,
+  type Place,
+  type RideLeg,
+  type Timed,
+} from './trip';
 import { CLEAR, loadWeather, Precipitation, weatherOverride, type Weather } from './weather';
 
 const POLL_MS = 12_000;
@@ -308,7 +322,7 @@ const color = (hex: string) => {
 
 type Tab = 'lines' | 'alerts' | 'following' | 'map';
 let tab: Tab = 'lines';
-type Selection = { kind: 'train' | 'station' | 'dock'; id: string } | null;
+type Selection = { kind: 'train' | 'station' | 'dock' | 'trip'; id: string } | null;
 let selection: Selection = null;
 /** Ride along behind the train, or from the driver's seat. */
 type CameraMode = 'free' | 'follow' | 'ride' | 'cab';
@@ -609,6 +623,44 @@ function addLayers() {
     },
   });
 
+  // Directions: the ride in its line's color over a soft glow, the walking
+  // in dots, under the trains so yours can be seen running along it.
+  map.addSource('trip', { type: 'geojson', data: empty() });
+  map.addSource('trip-points', { type: 'geojson', data: empty() });
+  const tripWidth = (lo: number, hi: number) => ['interpolate', ['exponential', 1.5], ['zoom'], 10, lo, 17, hi] as any;
+  map.addLayer({
+    id: 'trip-glow',
+    type: 'line',
+    source: 'trip',
+    filter: ['==', ['get', 'kind'], 'ride'],
+    layout: { 'line-cap': 'round', 'line-join': 'round' },
+    paint: { 'line-color': ['get', 'color'], 'line-width': tripWidth(10, 26), 'line-opacity': 0.22, 'line-blur': 6 },
+  });
+  map.addLayer({
+    id: 'trip-casing',
+    type: 'line',
+    source: 'trip',
+    filter: ['==', ['get', 'kind'], 'ride'],
+    layout: { 'line-cap': 'round', 'line-join': 'round' },
+    paint: { 'line-color': PALETTE.background, 'line-width': tripWidth(6.5, 13) },
+  });
+  map.addLayer({
+    id: 'trip-ride',
+    type: 'line',
+    source: 'trip',
+    filter: ['==', ['get', 'kind'], 'ride'],
+    layout: { 'line-cap': 'round', 'line-join': 'round' },
+    paint: { 'line-color': ['get', 'color'], 'line-width': tripWidth(4, 9) },
+  });
+  map.addLayer({
+    id: 'trip-walk',
+    type: 'line',
+    source: 'trip',
+    filter: ['==', ['get', 'kind'], 'walk'],
+    layout: { 'line-cap': 'round', 'line-join': 'round' },
+    paint: { 'line-color': '#e6e9ef', 'line-width': tripWidth(3, 6), 'line-dasharray': [0.1, 2] },
+  });
+
   // Trains draw above the lines and stations, below the labels.
   map.addLayer(trainLayer);
 
@@ -637,6 +689,39 @@ function addLayers() {
       'circle-color': '#3b82f6',
       'circle-stroke-color': '#ffffff',
       'circle-stroke-width': 2.5,
+    },
+  });
+
+  map.addLayer({
+    id: 'trip-stops',
+    type: 'circle',
+    source: 'trip-points',
+    paint: {
+      'circle-radius': ['match', ['get', 'role'], 'to', 9, 'from', 7, 6],
+      'circle-color': ['match', ['get', 'role'], 'stop', '#ffffff', ['get', 'color']],
+      'circle-stroke-color': ['match', ['get', 'role'], 'stop', ['get', 'color'], '#ffffff'],
+      'circle-stroke-width': ['match', ['get', 'role'], 'stop', 3.5, 2.5],
+      'circle-pitch-alignment': 'viewport',
+    },
+  });
+  map.addLayer({
+    id: 'trip-labels',
+    type: 'symbol',
+    source: 'trip-points',
+    layout: {
+      'text-field': ['get', 'name'],
+      'text-font': ['Noto Sans Bold'],
+      'text-size': 12.5,
+      'text-offset': [0, -1.4],
+      'text-anchor': 'bottom',
+      'text-max-width': 12,
+      'text-allow-overlap': false,
+      'symbol-sort-key': ['match', ['get', 'role'], 'to', 0, 'stop', 1, 2],
+    },
+    paint: {
+      'text-color': '#f3f5f8',
+      'text-halo-color': PALETTE.background,
+      'text-halo-width': 2,
     },
   });
 
@@ -761,7 +846,10 @@ function applyLayerToggles() {
   const vis = (on: boolean) => (on ? 'visible' : 'none');
   map.setLayoutProperty('speed-lines', 'visibility', vis(layers.speed));
   for (const id of ['bikes', 'bike-counts']) map.setLayoutProperty(id, 'visibility', vis(layers.bikes));
-  for (const kind of LINE_KINDS) map.setPaintProperty(`${kind}-lines`, 'line-opacity', layers.speed ? 0.15 : LINE_OPACITY[kind]);
+  // Lines step back behind the speed map, and behind a trip being shown.
+  const showingTrip = tripActive && !!chosenPlan();
+  for (const kind of LINE_KINDS)
+    map.setPaintProperty(`${kind}-lines`, 'line-opacity', layers.speed ? 0.15 : showingTrip ? LINE_OPACITY[kind] * 0.35 : LINE_OPACITY[kind]);
   for (const id of ['alert-lines', 'alert-stations']) map.setLayoutProperty(id, 'visibility', vis(layers.alerts));
   $('#speed-legend').hidden = !layers.speed;
   if (layers.speed) drawSpeedMap();
@@ -1438,6 +1526,7 @@ function driveCamera(now: number) {
   const dt = Math.min(0.5, (now - lastCamera) / 1000);
   lastCamera = now;
   if (touring && now > tourNext) nextTourStop();
+  if (previewing) return;
   // Never steer while someone has their hands on the map: moving the camera
   // resets MapLibre's gesture handlers, so a pinch or twist could never start.
   // In the cab, dragging looks around (handled below), so the camera keeps riding.
@@ -1806,12 +1895,16 @@ function featureAt(point: maplibregl.Point, layerIds: string[]) {
 
 map.on('click', (e) => {
   if (riding()) return;
+  // Choosing a start or destination: the tapped spot is it.
+  if (selection?.kind === 'trip' && trip.editing) return pickOnMap(e.lngLat.lng, e.lngLat.lat);
   const train = trainAt(e.point);
   if (train) return select({ kind: 'train', id: train });
   const station = featureAt(e.point, ['stations']);
   if (station) return select({ kind: 'station', id: String(station.properties.id) });
   const dock = featureAt(e.point, ['bikes']);
   if (dock) return select({ kind: 'dock', id: String(dock.properties.id) });
+  // Directions stay up until they're closed.
+  if (selection?.kind === 'trip') return;
   select(null);
 });
 
@@ -1887,6 +1980,12 @@ const ICON = {
   station: '<svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="4.5" fill="none" stroke="currentColor" stroke-width="2"/></svg>',
   search:
     '<svg viewBox="0 0 16 16"><circle cx="7" cy="7" r="4.6" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="m10.5 10.5 3.5 3.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>',
+  locate:
+    '<svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="4.2" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="8" cy="8" r="1.6" fill="currentColor"/><path d="M8 1.2v2.2M8 12.6v2.2M1.2 8h2.2M12.6 8h2.2" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>',
+  swap: '<svg viewBox="0 0 16 16"><path d="M5 13V3M2.5 5.5 5 3l2.5 2.5M11 3v10M8.5 10.5 11 13l2.5-2.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+  chevronRight: '<svg viewBox="0 0 16 16"><path d="m6.5 4 4 4-4 4" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+  directions:
+    '<svg viewBox="0 0 16 16"><path d="M8 1.5 14.5 8 8 14.5 1.5 8z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/><path d="M6 10V7.5h4M8.5 6 10 7.5 8.5 9" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>',
 };
 
 function setNotice(message: string | null) {
@@ -1929,6 +2028,9 @@ function tick() {
     const el = hudEl.querySelector('[data-tour-left]');
     if (el) el.textContent = `${left}s`;
   }
+  document.querySelectorAll<HTMLElement>('[data-leave]').forEach((el) => {
+    if (el.dataset.leave) el.textContent = leaveText(Number(el.dataset.leave));
+  });
   renderCommute();
   remindIfTime();
 }
@@ -2435,14 +2537,18 @@ let refreshTimer: number | undefined;
 function select(next: Selection, keepTour = false) {
   if (!keepTour) setTouring(false);
   if (next?.kind === selection?.kind && next?.id === selection?.id) return;
+  // Closing (not stepping back to it) ends the directions too.
+  if (!next && tripActive) closeTrip();
   selection = next;
   upcoming = null;
   departures = null;
   clearInterval(refreshTimer);
   if (cameraMode !== 'free' && !keepTour) setCameraMode('free');
-  const hash = next && next.kind !== 'dock' ? `#${next.kind}=${encodeURIComponent(next.id)}` : '';
+  const hash = next && next.kind !== 'dock' && next.kind !== 'trip' ? `#${next.kind}=${encodeURIComponent(next.id)}` : '';
   history.replaceState(null, '', hash || location.pathname + location.search);
   sheetEl.classList.toggle('has-detail', !!next);
+  // Directions open: the card that opens them steps aside.
+  sheetEl.classList.toggle('has-trip', next?.kind === 'trip');
   renderDetail();
   if (!next) return;
   detailEl.scrollTop = 0;
@@ -2457,6 +2563,10 @@ function select(next: Selection, keepTour = false) {
 async function refreshPanelData() {
   if (document.hidden || !selection || selection.kind === 'dock') return;
   const sel = selection;
+  if (sel.kind === 'trip') {
+    refreshTrip();
+    return;
+  }
   // Amtrak's own feed already carries its stops.
   if (sel.kind === 'train' && isAmtrak(sel.id)) {
     upcoming = amtrakStops(sel.id);
@@ -2473,8 +2583,6 @@ async function refreshPanelData() {
     } else {
       const deps = await loadDepartures(sel.id);
       if (selection === sel) departures = deps;
-      // The same answer serves the commute card, saving a request.
-      if (commute?.stationId === sel.id) setCommuteDepartures(deps);
     }
     if (selection === sel) {
       renderDetail();
@@ -2503,7 +2611,8 @@ function updatePadding(immediate = false) {
 addEventListener('resize', () => updatePadding());
 
 function detailNav(starredId?: string) {
-  const label = { lines: 'Lines', alerts: 'Alerts', following: 'Following', map: 'Map' }[tab];
+  const label =
+    tripActive && selection?.kind !== 'trip' ? 'Directions' : { lines: 'Lines', alerts: 'Alerts', following: 'Following', map: 'Map' }[tab];
   const on = starredId ? isFollowed(starredId) : false;
   const star = starredId
     ? `<button class="icon-btn${on ? ' starred' : ''}" data-action="star" aria-pressed="${on}" aria-label="${on ? 'Stop following' : 'Follow'}" title="${
@@ -2523,6 +2632,7 @@ function renderDetail() {
   }
   if (selection.kind === 'train') renderTrain(selection.id);
   else if (selection.kind === 'station') renderStation(selection.id);
+  else if (selection.kind === 'trip') renderTrip();
   else renderDock(selection.id);
 }
 
@@ -2621,7 +2731,6 @@ function renderStation(id: string) {
   if (!s || !network) return;
   const c = s.ferry ? displayColor('#008EAA') : s.rail ? displayColor('#80276C') : s.bus ? displayColor('#7C878E') : '#ffffff';
   detailEl.style.setProperty('--c', c);
-  const mine = commute?.stationId === s.id ? commute : null;
 
   let body = '<p class="muted">Loading departures…</p>';
   if (departures) {
@@ -2641,7 +2750,6 @@ function renderStation(id: string) {
             const first = g.deps[0];
             const live = first.vehicleId && trains.has(first.vehicleId);
             const line = g.route.type === 3 ? g.route.short : g.route.name.replace(' Line', '');
-            const pinned = mine?.routeId === g.route.id && mine.headsign === g.headsign;
             return `<li style="--c:${displayColor(g.route.color)};--i:${i}">
               <button class="card" ${live ? `data-train="${escape(first.vehicleId!)}"` : 'disabled'}>
                 <span class="card-bar"></span>
@@ -2655,34 +2763,12 @@ function renderStation(id: string) {
                 }</span>
                 <span class="card-side"><time data-at="${first.at}">${countdown(first.at)}</time></span>
               </button>
-              <button class="icon-btn subtle pin${pinned ? ' on' : ''}" data-pin="${escape(`${g.route.id}|${g.headsign}`)}" aria-pressed="${pinned}" aria-label="${
-                pinned ? 'Your commute' : 'Make this my commute'
-              }" title="${pinned ? 'Your commute' : 'Make this my commute'}">${pinned ? ICON.pinOn : ICON.pin}</button>
             </li>`;
           })
           .join('')}</ul>`
       : '<p class="muted">Nothing predicted here right now.</p>';
   }
 
-  const commuteCard = mine
-    ? `<section class="commute-settings">
-        <div class="commute-head"><span>${ICON.pinOn}My commute</span><button class="link" data-commute="clear">Remove</button></div>
-        <div class="setting">
-          <span class="setting-icon">${ICON.walk}</span>
-          <span class="setting-text"><strong>Walk to the platform</strong><small>Counted when it says leave</small></span>
-          <div class="stepper">
-            <button data-commute="walk-down" aria-label="Less walking time">−</button>
-            <b>${mine.walk}<small>min</small></b>
-            <button data-commute="walk-up" aria-label="More walking time">+</button>
-          </div>
-        </div>
-        <div class="setting">
-          <span class="setting-icon">${ICON.bell}</span>
-          <span class="setting-text"><strong>Remind me to leave</strong><small>${reminderNote()}</small></span>
-          <button class="switch" role="switch" aria-checked="${mine.remind}" aria-label="Remind me to leave" data-commute="remind"></button>
-        </div>
-      </section>`
-    : '';
   const notes = stationAlerts(s)
     .sort((a, b) => Number(alertKind(b) === 'service') - Number(alertKind(a) === 'service'))
     .slice(0, 3)
@@ -2695,11 +2781,11 @@ function renderStation(id: string) {
       <p class="eyebrow"><span class="dot"></span>${s.ferry ? 'Ferry pier' : s.rail ? 'Commuter rail station' : s.bus ? 'Silver Line stop' : 'Station'}</p>
       <h2>${escape(s.name)}</h2>
     </div>
+    <div class="actions"><button class="btn primary" data-action="directions">${ICON.directions}Directions here</button></div>
     ${notes}
-    ${commuteCard}
     <h3>Departures</h3>
     ${body}
-    <p class="fine">Live MBTA predictions. Tap one to jump to it, or the pin to make it your commute.</p>`;
+    <p class="fine">Live MBTA predictions. Tap one to jump to its train.</p>`;
 }
 
 function renderDock(id: string) {
@@ -2815,9 +2901,10 @@ function focusGroup(id: string) {
 
 sheetEl.addEventListener('click', (e) => {
   const el = (e.target as HTMLElement).closest<HTMLElement>(
-    '[data-tab],[data-toggle],[data-show-alerts],[data-focus],[data-layer],[data-view],[data-action],[data-train],[data-unfollow],[data-alert-map],[data-open-alert],[data-pin],[data-commute],[data-result]',
+    '[data-tab],[data-toggle],[data-show-alerts],[data-focus],[data-layer],[data-view],[data-action],[data-train],[data-unfollow],[data-alert-map],[data-open-alert],[data-trip],[data-trip-pick],[data-trip-choose],[data-result]',
   );
-  if (!el) return;
+  // The sheet carries its own data-tab; a click on nothing in particular isn't a tab.
+  if (!el || el === sheetEl) return;
   const d = el.dataset;
   if (d.tab) setTab(d.tab as Tab);
   else if (d.toggle) {
@@ -2848,10 +2935,27 @@ sheetEl.addEventListener('click', (e) => {
     openAlerts.add(d.openAlert);
     renderMain();
     mainEl.querySelector(`[data-alert="${CSS.escape(d.openAlert)}"]`)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
-  } else if (d.pin && selection?.kind === 'station') pinCommute(selection.id, d.pin);
-  else if (d.commute) changeCommute(d.commute);
-  else if (d.result) chooseResult(Number(d.result));
-  else if (d.action === 'back') select(null);
+  } else if (d.trip) tripAction(d.trip, el);
+  else if (d.tripPick) {
+    const p = placeResults[Number(d.tripPick)];
+    if (p) pickPlace(p.kind === 'here' ? null : { name: p.name, detail: p.detail, lng: p.lng, lat: p.lat, stationId: p.stationId });
+  } else if (d.tripChoose) {
+    trip.chosen = d.tripChoose;
+    trip.picked = true;
+    stopPreview();
+    renderDetail();
+    detailEl.scrollTop = 0;
+    drawTrip();
+    fitTrip();
+  } else if (d.result) chooseResult(Number(d.result));
+  else if (d.action === 'back') {
+    // From a train or station looked at along the way, back to the directions.
+    if (tripActive && selection?.kind !== 'trip') resumeTrip();
+    else select(null);
+  } else if (d.action === 'directions' && selection?.kind === 'station') {
+    const st = stations.find((x) => x.id === selection!.id);
+    if (st) openTrip(stationPlace(st));
+  }
   else if (d.action === 'star' && selection?.kind === 'train') toggleFollow(selection.id);
   else if (d.action === 'ride') setCameraMode('ride');
   else if (d.action === 'cab') setCameraMode('cab');
@@ -3058,130 +3162,954 @@ searchEl.addEventListener('keydown', (e) => {
 });
 $('.search').addEventListener('click', () => searchEl.focus());
 
-// My commute -----------------------------------------------------------------------
+// Getting there ------------------------------------------------------------------
 //
-// One trip you take often, pinned from a station's departures. The header
-// counts down to when you need to leave to make the next one you can catch,
-// and, while the app is open, a notification says when to go.
+// "Where to?": directions from where you are (by GPS) or any place, to a
+// station or an address, by T and on foot. The trip is drawn on the map, the
+// real way on foot and the real track, with live times for each train, and
+// a preview flies the whole route. Save one as your commute and the top of
+// the sidebar counts down to when to leave, and flips to the way back when
+// you're at the other end.
 
-interface Commute {
-  stationId: string;
-  stationName: string;
-  routeId: string;
-  headsign: string;
-  /** Minutes on foot to the platform. */
-  walk: number;
-  remind: boolean;
+let graph: TransitGraph | null = null;
+let graphLoading: Promise<TransitGraph | null> | null = null;
+
+/** The network as a graph of rides and walks, loaded the first time it's needed. */
+function loadGraph(): Promise<TransitGraph | null> {
+  if (graph) return Promise.resolve(graph);
+  if (!network) return Promise.resolve(null);
+  const net = network;
+  graphLoading ??= loadPatterns(mbtaRouteIds)
+    .then((patterns) => (graph = new TransitGraph(net, stations, patterns, stationByStop, trackOf)))
+    .catch((err) => {
+      graphLoading = null;
+      handleError(err, 'Couldn’t load the network for directions');
+      return null;
+    });
+  return graphLoading;
 }
-const COMMUTE_KEY = 'live-boston:commute';
-let commute: Commute | null = load<Commute | null>(COMMUTE_KEY, null);
-let commuteDeps: Departure[] | null = null;
-let remindedAt = 0;
 
-async function refreshCommute() {
-  if (!commute || document.hidden || Date.now() < pausedUntil) return;
-  // The open station panel fetches the same thing; let it.
-  if (selection?.kind === 'station' && selection.id === commute.stationId) return;
+const HERE = 'Your location';
+
+interface TripState {
+  /** null: wherever you are, by GPS. */
+  from: Place | null;
+  to: Place | null;
+  editing: 'from' | 'to' | null;
+  /** Where the plan actually starts, once found. */
+  origin: Place | null;
+  plans: Itinerary[] | null;
+  timed: Timed[] | null;
+  /** The chosen way, by its key, so it stays chosen as times refresh. */
+  chosen: string | null;
+  status: string | null;
+  busy: boolean;
+  /** They chose a way themselves; times refreshing shouldn't switch it. */
+  picked: boolean;
+}
+let trip: TripState = blankTrip();
+/** Directions are open, or set aside while looking at a train or station on the way. */
+let tripActive = false;
+let planSeq = 0;
+
+function blankTrip(): TripState {
+  return { from: null, to: null, editing: null, origin: null, plans: null, timed: null, chosen: null, status: null, busy: false, picked: false };
+}
+
+const planKey = (it: Itinerary) => it.legs.map((l) => (l.kind === 'ride' ? `${l.board.id}>${l.alight.id}` : 'w')).join('|');
+const samePlace = (a: Place | null, b: Place | null) => !!a && !!b && Math.abs(a.lng - b.lng) < 1e-4 && Math.abs(a.lat - b.lat) < 1e-4;
+function meters(a: { lng: number; lat: number }, b: { lng: number; lat: number }) {
+  const [ax, ay] = toLocal(a.lng, a.lat);
+  const [bx, by] = toLocal(b.lng, b.lat);
+  return Math.hypot(bx - ax, by - ay);
+}
+
+function stationPlace(s: Station): Place {
+  return { name: s.name, lng: s.lng, lat: s.lat, stationId: s.id };
+}
+
+function nearestStation(p: { lng: number; lat: number }) {
+  let best: { s: Station; d: number } | null = null;
+  for (const s of stations) {
+    const d = meters(p, s);
+    if (!best || d < best.d) best = { s, d };
+  }
+  return best;
+}
+
+/** Opens directions, to a place if one is given (otherwise it asks where to). */
+function openTrip(to: Place | null = null, from: Place | null = null) {
+  stopPreview();
+  trip = { ...blankTrip(), to, from, editing: to ? null : 'to' };
+  tripActive = true;
+  closeSearch();
+  if (selection?.kind === 'trip') renderDetail();
+  else select({ kind: 'trip', id: 'go' });
+  if (isPhone()) sheet.set(to ? 'half' : 'full');
+  if (to) planTrip();
+  else focusTripInput();
+}
+
+/** Back to the trip that was open before looking at a train or station on it. */
+function resumeTrip() {
+  if (selection?.kind === 'trip') return;
+  select({ kind: 'trip', id: 'go' });
+  drawTrip();
+}
+
+function closeTrip() {
+  tripActive = false;
+  stopPreview();
+  trip = blankTrip();
+  drawTrip();
+}
+
+async function planTrip(keepView = false) {
+  const seq = ++planSeq;
+  const t = trip;
+  if (!t.to) return;
+  t.busy = true;
+  t.status = t.from ? 'Finding the way…' : 'Finding you…';
+  renderTripPanel();
+  let origin = t.from;
+  if (!origin) {
+    const fix = await whereAmI();
+    if (seq !== planSeq) return;
+    if (!fix) {
+      t.busy = false;
+      t.status = locationDenied
+        ? 'Location is off for this site. Choose where you’re starting from.'
+        : 'Couldn’t find you yet. Choose where you’re starting from.';
+      t.editing = 'from';
+      renderTripPanel();
+      focusTripInput();
+      return;
+    }
+    origin = { name: HERE, lng: fix.lng, lat: fix.lat };
+  }
+  t.origin = origin;
+  t.status = 'Finding the way…';
+  renderTripPanel();
+  const g = await loadGraph();
+  if (seq !== planSeq) return;
+  if (!g) {
+    t.busy = false;
+    t.status = 'Couldn’t load the T’s network. Try again in a moment.';
+    renderTripPanel();
+    return;
+  }
+  const plans = g.plan(origin, t.to);
+  t.plans = plans;
+  t.timed = null;
+  altsTimedAt = 0;
+  if (!plans.length) {
+    t.busy = false;
+    t.status = 'No way there by T from here. Is it within about 1½ miles of a station?';
+    renderTripPanel();
+    drawTrip();
+    return;
+  }
+  if (!t.chosen || !plans.some((p) => planKey(p) === t.chosen)) t.chosen = planKey(plans[0]);
+  t.status = null;
+  drawTrip();
+  if (!keepView) fitTrip();
+  renderTripPanel();
+  // The real way on foot, then the trains.
+  await Promise.all(plans.map(routeWalks));
+  if (seq !== planSeq) return;
+  drawTrip();
+  await timeTrip(seq);
+}
+
+/** Times one way, leg by leg; a leg the MBTA won't answer for gets a usual wait. */
+async function timePlan(p: Itinerary, maxAge: number) {
+  const runs = await Promise.all(
+    p.legs.map((l) =>
+      l.kind === 'ride'
+        ? runsFor(l, maxAge).catch((err) => {
+            if (err instanceof RateLimited) handleError(err, '');
+            else console.warn(err);
+            return null;
+          })
+        : null,
+    ),
+  );
+  return schedule(p, runs, Date.now());
+}
+
+let altsTimedAt = 0;
+
+/**
+ * Live times for the chosen way, then the others, soonest arrival first.
+ * Without an API key the MBTA allows 20 requests a minute, shared with
+ * everything else on the map, so the other ways are timed less often.
+ */
+async function timeTrip(seq = planSeq) {
+  const t = trip;
+  if (!t.plans?.length) return;
+  t.busy = true;
+  const chosen = chosenPlan(t) ?? t.plans[0];
+  const first = await timePlan(chosen, 25_000);
+  if (seq !== planSeq) return;
+  const others = t.plans.filter((p) => p !== chosen);
+  const fresh = Date.now() - altsTimedAt > 90_000 || !t.timed || t.timed.length < t.plans.length;
+  let rest: Timed[];
+  if (fresh && Date.now() > pausedUntil) {
+    rest = [];
+    // One at a time, so a burst doesn't hit the limit.
+    for (const p of others) {
+      rest.push(await timePlan(p, 90_000));
+      if (seq !== planSeq) return;
+    }
+    altsTimedAt = Date.now();
+  } else rest = (t.timed ?? []).filter((x) => others.includes(x.itin));
+  t.timed = [first, ...rest].sort((a, b) => a.arrive - b.arrive);
+  t.busy = false;
+  // The first time, pick the soonest arrival; after that, keep their choice.
+  if (!t.picked) t.chosen = planKey(t.timed[0].itin);
+  if (t === trip && selection?.kind === 'trip') {
+    renderTripPanel();
+    drawTrip();
+  }
+  if (commute && samePlace(t.to, commuteTarget()?.to ?? null) && !t.from) shareWithCommute(t);
+}
+
+function chosenTimed(t = trip) {
+  return t.timed?.find((x) => planKey(x.itin) === t.chosen) ?? null;
+}
+function chosenPlan(t = trip) {
+  return t.plans?.find((p) => planKey(p) === t.chosen) ?? null;
+}
+
+async function refreshTrip() {
+  const t = trip;
+  if (!t.to || !t.plans) return;
+  // On the move: plan again from where you are now.
+  if (!t.from && me && t.origin && meters(me, t.origin) > 150) {
+    planTrip(true);
+    return;
+  }
+  await timeTrip();
+}
+
+// Where you are, for directions ---------------------------------------------------
+
+let locationDenied = false;
+let quietLocate = false;
+const fixWaiters: ((f: Fix | null) => void)[] = [];
+
+/** A recent GPS fix, starting location quietly (no fly-to) if it's off. */
+function whereAmI(timeout = 15_000): Promise<Fix | null> {
+  if (me && Date.now() - me.at < 60_000) return Promise.resolve(me);
+  if (!('geolocation' in navigator)) return Promise.resolve(null);
+  if (watchId == null) startLocate(true);
+  return new Promise((resolve) => {
+    fixWaiters.push(resolve);
+    setTimeout(() => {
+      const i = fixWaiters.indexOf(resolve);
+      if (i >= 0) fixWaiters.splice(i, 1);
+      resolve(me);
+    }, timeout);
+  });
+}
+
+function settleWaiters(fix: Fix | null) {
+  for (const w of fixWaiters.splice(0)) w(fix);
+}
+
+/** Whether the site may already use location, so asking won't pop up a prompt. */
+async function locationGranted() {
   try {
-    setCommuteDepartures(await loadDepartures(commute.stationId));
-  } catch (err) {
-    if (err instanceof RateLimited) handleError(err, '');
-    else console.warn(err);
+    return (await navigator.permissions?.query({ name: 'geolocation' }))?.state === 'granted';
+  } catch {
+    return false;
   }
 }
 
-function setCommuteDepartures(deps: Departure[]) {
-  if (!commute) return;
-  const c = commute;
-  commuteDeps = deps.filter((d) => d.routeId === c.routeId && d.headsign === c.headsign);
+// Choosing places ---------------------------------------------------------------
+
+let placeResults: (Place & { kind: 'here' | 'station' | 'place' | 'saved' })[] = [];
+let placeQuery = '';
+let placeAbort: AbortController | null = null;
+let placeTimer: number | undefined;
+
+function focusTripInput() {
+  requestAnimationFrame(() => detailEl.querySelector<HTMLInputElement>('#trip-input')?.focus());
+}
+
+function stationColor(s: Station) {
+  return s.ferry ? displayColor('#008EAA') : s.rail ? displayColor('#80276C') : s.bus ? displayColor('#7C878E') : '#ffffff';
+}
+
+function suggestPlaces(q: string) {
+  placeQuery = q;
+  const list: typeof placeResults = [];
+  if (trip.editing === 'from') list.push({ kind: 'here', name: HERE, lng: 0, lat: 0 });
+  if (!q.trim()) {
+    // Your commute's two ends, for a quick start.
+    if (commute) {
+      for (const p of [commute.to, commute.home]) if (!list.some((x) => samePlace(x, p))) list.push({ ...p, kind: 'saved' });
+    }
+    placeResults = list;
+    renderPlaceResults();
+    return;
+  }
+  const found = search(
+    searchItems().filter((i) => i.kind === 'station'),
+    q,
+    4,
+  );
+  for (const r of found) {
+    const s = stations.find((x) => x.id === r.id);
+    if (s) list.push({ ...stationPlace(s), detail: r.subtitle, kind: 'station' });
+  }
+  placeResults = list;
+  renderPlaceResults();
+  // Addresses and places, once typing pauses.
+  clearTimeout(placeTimer);
+  placeAbort?.abort();
+  if (q.trim().length < 3 || !typeaheadUp()) {
+    renderPlaceResults();
+    return;
+  }
+  placeTimer = window.setTimeout(() => lookUpAddresses(q, list), 280);
+}
+
+let lookingUp = false;
+async function lookUpAddresses(q: string, list = placeResults.filter((p) => p.kind !== 'place'), submitted = false) {
+  placeAbort?.abort();
+  const ctrl = (placeAbort = new AbortController());
+  lookingUp = true;
+  renderPlaceResults(true);
+  try {
+    const places = await searchPlaces(q, ctrl.signal, submitted);
+    if (placeQuery !== q) return;
+    // A station already listed beats the same name as a place.
+    const names = new Set(list.map((p) => p.name.toLowerCase()));
+    placeResults = [...list, ...places.filter((p) => !names.has(p.name.toLowerCase())).map((p) => ({ ...p, kind: 'place' as const }))];
+  } catch (err) {
+    if (ctrl.signal.aborted) return;
+    console.warn(err);
+  } finally {
+    if (placeAbort === ctrl) lookingUp = false;
+  }
+  if (placeQuery === q) renderPlaceResults();
+}
+
+function renderPlaceResults(searching = false) {
+  const el = detailEl.querySelector('#trip-results');
+  if (!el) return;
+  const items = placeResults
+    .map((p, i) => {
+      const icon = p.kind === 'here' ? ICON.locate : p.kind === 'station' ? ICON.station : p.kind === 'saved' ? ICON.pinOn : ICON.pin;
+      const color = p.kind === 'here' ? '#3b82f6' : p.kind === 'station' && p.stationId ? stationColor(stations.find((s) => s.id === p.stationId)!) : '#a3aab6';
+      const sub = p.kind === 'here' ? 'By GPS' : p.kind === 'saved' ? (samePlace(p, commute?.home ?? null) ? 'Your commute’s start' : 'Your commute') : (p.detail ?? '');
+      return `<li><button class="result${i === 0 && placeQuery ? ' active' : ''}" data-trip-pick="${i}" style="--c:${color}">
+        <span class="result-icon">${icon}</span>
+        <span class="result-text"><strong>${escape(p.name)}</strong>${sub ? `<small>${escape(sub)}</small>` : ''}</span>
+      </button></li>`;
+    })
+    .join('');
+  const q = placeQuery.trim();
+  const hint = !q
+    ? '<p class="fine tight">Type a station, an address or a place. Or tap the map.</p>'
+    : searching || lookingUp
+      ? '<p class="fine tight trip-status"><span class="spinner"></span>Looking up addresses…</p>'
+      : q.length >= 3 && !placeResults.some((p) => p.kind === 'place')
+        ? `<p class="fine tight">${placeResults.length ? 'Not it?' : `Nothing found for “${escape(q)}”.`} Press Enter to search addresses, or tap the map.</p>`
+        : '';
+  el.innerHTML = `${items ? `<ul class="results">${items}</ul>` : ''}${hint}`;
+}
+
+function pickPlace(p: Place | null) {
+  const which = trip.editing;
+  if (!which) return;
+  if (which === 'from') trip.from = p;
+  else trip.to = p;
+  trip.editing = null;
+  placeQuery = '';
+  if (isPhone()) sheet.set('half');
+  if (trip.to) planTrip();
+  else {
+    trip.editing = 'to';
+    renderTripPanel();
+    focusTripInput();
+  }
+}
+
+/** A tapped spot on the map, while choosing a place. */
+function pickOnMap(lng: number, lat: number) {
+  const near = nearestStation({ lng, lat });
+  const s = near && near.d < 60 ? near.s : null;
+  pickPlace(s ? stationPlace(s) : { name: 'Dropped pin', detail: near ? `Near ${near.s.name}` : undefined, lng, lat });
+}
+
+// The trip panel -------------------------------------------------------------------
+
+function fmtMins(seconds: number) {
+  const m = Math.max(1, Math.round(seconds / 60));
+  if (m < 60) return `${m} min`;
+  return `${Math.floor(m / 60)} hr${m % 60 ? ` ${m % 60} min` : ''}`;
+}
+
+function fmtDistance(m: number) {
+  const ft = m * 3.281;
+  return ft < 1000 ? `${Math.round(ft / 10) * 10} ft` : `${(m / 1609.34).toFixed(1)} mi`;
+}
+
+function legRoute(leg: RideLeg, run?: Run) {
+  return network?.routes.get(run?.routeId ?? leg.pattern.routeId) ?? network?.routes.get(leg.routes[0]);
+}
+
+/** A short name for a line, for chips: "Red", "Green B", "SL1", "Ferry". */
+function lineShort(r: Route | undefined) {
+  if (!r) return 'T';
+  if (r.type === 3) return r.short;
+  if (r.type === 2) return 'Rail';
+  if (r.type === 4) return 'Ferry';
+  return r.name.replace(' Line', '');
+}
+
+/** The line as riders name it: "Red Line", "Green Line B", "Providence/Stoughton Line". */
+function lineName(r: Route | undefined) {
+  if (!r) return 'Train';
+  return r.type === 2 ? `${r.name.replace(/ Line$/, '')} Line` : r.name;
+}
+
+function leaveText(at: number) {
+  const s = (at - Date.now()) / 1000;
+  if (s <= 60) return 'now';
+  if (s >= 3600) return clockFmt.format(at);
+  return `${Math.round(s / 60)} min`;
+}
+
+function journeyBar(it: Itinerary, tm: Timed | null) {
+  const durs = it.legs.map((l, i) => {
+    const x = tm?.legs[i];
+    return Math.max(60, x ? (x.end - x.start) / 1000 : l.seconds);
+  });
+  const total = durs.reduce((a, b) => a + b, 0);
+  return `<div class="journey" aria-hidden="true">${it.legs
+    .map((l, i) => {
+      const grow = Math.max(0.08, durs[i] / total);
+      if (l.kind === 'walk') return `<span class="seg-walk" style="flex:${grow}">${ICON.walk}</span>`;
+      const r = legRoute(l, tm?.legs[i].run);
+      return `<span class="seg-ride" style="flex:${grow};--c:${r ? displayColor(r.color) : '#777'}">${escape(lineShort(r))}</span>`;
+    })
+    .join('')}</div>`;
+}
+
+/** Where your train is right now, if it's on the map. */
+function liveTrainNote(run?: Run) {
+  const t = run?.vehicleId ? trains.get(run.vehicleId) : undefined;
+  if (!t) return '';
+  return `<button class="live-train" data-trip="watch" data-vehicle="${escape(t.v.id)}"><span class="pulse-dot"></span>${statusLine(t)} now<span class="link">Watch it</span></button>`;
+}
+
+function stepsHtml(it: Itinerary, tm: Timed | null) {
+  const rows: string[] = [];
+  it.legs.forEach((leg, i) => {
+    const x = tm?.legs[i];
+    if (leg.kind === 'walk') {
+      const last = i === it.legs.length - 1;
+      const toName = last ? trip.to?.name ?? leg.to.name : leg.to.name;
+      rows.push(`<li class="step walk">
+        <span class="step-icon">${ICON.walk}</span>
+        <div class="step-text"><strong>Walk to ${escape(toName)}</strong><small>${fmtMins(leg.seconds)} · ${fmtDistance(leg.meters)}${leg.routed ? '' : ' as the crow flies'}</small></div>
+        ${x ? `<time>${clockFmt.format(x.start)}</time>` : ''}
+      </li>`);
+      return;
+    }
+    const run = x?.run;
+    const r = legRoute(leg, run);
+    const color = r ? displayColor(r.color) : '#777';
+    const toward = run?.headsign || leg.pattern.headsign;
+    const ride = x ? (x.end - x.start) / 1000 : leg.seconds;
+    let when = '';
+    if (run) {
+      const later = x?.later?.length ? ` · then ${x.later.map((l) => clockFmt.format(l.board)).join(', ')}` : '';
+      when = `<small class="when">Departs <b>${clockFmt.format(run.board)}</b> ${run.live ? '<em class="live">live</em>' : '<em>scheduled</em>'}${later}</small>`;
+    } else if (x?.guessed) {
+      when = '<small class="when">No times posted right now; allowing a usual wait</small>';
+    } else when = '<small class="when">Checking times…</small>';
+    const other = leg.routes.length > 1 && r?.type !== 2 ? `<small>Any ${escape(lineShort(r).split(' ')[0])} train toward ${escape(toward)} works</small>` : '';
+    rows.push(`<li class="step ride" style="--c:${color}">
+      <span class="step-icon line">${escape(lineShort(r))}</span>
+      <div class="step-text">
+        <strong>${escape(lineName(r))} <span>to ${escape(toward)}</span></strong>
+        <small>Board at ${escape(leg.board.name)}</small>
+        ${when}
+        ${liveTrainNote(run)}
+        ${other}
+        <small class="ride-len">Ride ${leg.stops} stop${leg.stops === 1 ? '' : 's'} · ${fmtMins(ride)} · off at <b>${escape(leg.alight.name)}</b></small>
+      </div>
+      ${x ? `<time>${clockFmt.format(x.start)}</time>` : ''}
+    </li>`);
+  });
+  rows.push(`<li class="step end">
+    <span class="step-icon">${ICON.pinOn}</span>
+    <div class="step-text"><strong>${escape(trip.to?.name ?? 'Arrive')}</strong>${trip.to?.detail ? `<small>${escape(trip.to.detail)}</small>` : ''}</div>
+    ${tm ? `<time>${clockFmt.format(tm.arrive)}</time>` : ''}
+  </li>`);
+  return `<ol class="steps">${rows.join('')}</ol>`;
+}
+
+function odRow(which: 'from' | 'to') {
+  const p = which === 'from' ? trip.from : trip.to;
+  if (trip.editing === which) {
+    return `<div class="od-row editing">
+      <span class="od-dot ${which}"></span>
+      <input id="trip-input" type="search" autocomplete="off" autocapitalize="off" spellcheck="false" enterkeyhint="go"
+        placeholder="${which === 'from' ? 'Starting from…' : 'Where to?'}" aria-label="${which === 'from' ? 'Starting point' : 'Destination'}" value="${escape(placeQuery)}" />
+      ${(which === 'from' ? true : !!trip.to) ? `<button class="link" data-trip="cancel-edit">Cancel</button>` : ''}
+    </div>`;
+  }
+  const name = which === 'from' ? (p?.name ?? HERE) : (p?.name ?? 'Choose a destination');
+  return `<button class="od-row" data-trip="edit-${which}">
+    <span class="od-dot ${which}${which === 'from' && !p ? ' here' : ''}"></span>
+    <span class="od-text"><small>${which === 'from' ? 'From' : 'To'}</small><strong>${escape(name)}</strong></span>
+  </button>`;
+}
+
+function renderTrip() {
+  detailEl.style.setProperty('--c', '#3b82f6');
+  const t = trip;
+  const plan = chosenPlan();
+  const tm = chosenTimed();
+  const isCommute = !!commute && !!t.to && (samePlace(t.to, commute.to) || samePlace(t.to, commute.home));
+
+  let body = '';
+  if (t.editing) {
+    body = '<div id="trip-results"></div>';
+  } else if (t.status && !plan) {
+    body = `<p class="muted trip-status">${t.busy ? '<span class="spinner"></span>' : ''}${escape(t.status)}</p>`;
+  } else if (plan) {
+    const walkOnly = plan.legs.length === 1 && plan.legs[0].kind === 'walk';
+    const leave = tm ? tm.leave : null;
+    const soon = leave !== null && leave - Date.now() <= 60_000;
+    const summary = `<div class="trip-sum${soon ? ' go' : ''}">
+        <div class="trip-leave"><small>${walkOnly ? 'Walk' : 'Leave'}${leave !== null && !soon ? ' in' : ''}</small><b data-leave="${leave ?? ''}">${leave !== null ? leaveText(leave) : '…'}</b></div>
+        <div class="trip-arrive"><small>Arrive</small><b>${tm ? clockFmt.format(tm.arrive) : '…'}</b><span>${tm ? fmtMins((tm.arrive - tm.leave) / 1000) : `about ${fmtMins(plan.typical)}`}</span></div>
+      </div>`;
+    const others = (t.timed ?? t.plans!.map((p) => ({ itin: p }) as Timed)).filter((x) => planKey(x.itin) !== t.chosen);
+    const alt = others.length
+      ? `<h3>Other ways</h3><ul class="cards alts">${others
+          .map((o, i) => {
+            const rides = o.itin.legs.filter((l): l is RideLeg => l.kind === 'ride');
+            const via = rides.length ? rides.map((l) => lineShort(legRoute(l, o.legs?.[o.itin.legs.indexOf(l)]?.run))).join(' → ') : 'Walk all the way';
+            return `<li style="--i:${i}"><button class="card alt" data-trip-choose="${escape(planKey(o.itin))}">
+              <span class="card-text"><strong>${escape(via)}</strong>${journeyBar(o.itin, o.leave ? o : null)}</span>
+              <span class="card-side">${o.arrive ? `<b>${clockFmt.format(o.arrive)}</b><small>leave ${leaveText(o.leave) === 'now' ? 'now' : `in ${leaveText(o.leave)}`}</small>` : `<b>${fmtMins(o.itin.typical)}</b>`}</span>
+            </button></li>`;
+          })
+          .join('')}</ul>`
+      : '';
+    const commuteBox = isCommute
+      ? `<section class="commute-settings">
+          <div class="commute-head"><span>${ICON.pinOn}Your commute</span><button class="link" data-trip="unsave">Remove</button></div>
+          <div class="setting">
+            <span class="setting-icon">${ICON.bell}</span>
+            <span class="setting-text"><strong>Remind me to leave</strong><small>${reminderNote()}</small></span>
+            <button class="switch" role="switch" aria-checked="${commute!.remind}" aria-label="Remind me to leave" data-trip="remind"></button>
+          </div>
+        </section>`
+      : '';
+    body = `${summary}
+      ${journeyBar(plan, tm)}
+      <div class="actions trip-actions">
+        <button class="btn primary" data-trip="preview">${ICON.play}Preview the trip</button>
+        ${isCommute ? '' : `<button class="btn" data-trip="save">${ICON.pin}Make it my commute</button>`}
+      </div>
+      ${commuteBox}
+      ${stepsHtml(plan, tm)}
+      ${alt}
+      <p class="fine">${t.busy && !tm ? 'Getting live times… · ' : ''}Live MBTA predictions, or the timetable where there are none. Walking routes from OpenStreetMap.</p>`;
+  }
+
+  detailEl.innerHTML = `
+    ${detailNav()}
+    <div class="hero">
+      <p class="eyebrow"><span class="dot"></span>Directions</p>
+      <h2>${t.to && !t.editing ? escape(t.to.name) : 'Where to?'}</h2>
+    </div>
+    <div class="od">
+      ${odRow('from')}
+      ${odRow('to')}
+      ${t.to && !t.editing ? `<button class="icon-btn subtle od-swap" data-trip="swap" aria-label="Swap start and destination" title="Swap">${ICON.swap}</button>` : ''}
+    </div>
+    ${body}`;
+  if (t.editing) {
+    if (!placeResults.length && !placeQuery) suggestPlaces('');
+    else renderPlaceResults();
+  }
+}
+
+/** Re-renders the trip panel unless someone is typing in it. */
+function renderTripPanel() {
+  if (selection?.kind !== 'trip') return;
+  const input = detailEl.querySelector<HTMLInputElement>('#trip-input');
+  if (trip.editing && input && document.activeElement === input) return;
+  const scroll = detailEl.scrollTop;
+  renderDetail();
+  detailEl.scrollTop = scroll;
+}
+
+function tripAction(action: string, el: HTMLElement) {
+  const t = trip;
+  if (action === 'edit-from' || action === 'edit-to') {
+    stopPreview();
+    t.editing = action === 'edit-from' ? 'from' : 'to';
+    placeQuery = '';
+    placeResults = [];
+    renderDetail();
+    if (isPhone()) sheet.set('full');
+    focusTripInput();
+  } else if (action === 'cancel-edit') {
+    t.editing = null;
+    placeQuery = '';
+    renderDetail();
+    if (isPhone()) sheet.set('half');
+  } else if (action === 'swap') {
+    // "Your location" can't be a destination; swapping it in uses where you are now.
+    const from = t.from ?? (t.origin ? { ...t.origin, name: me ? 'Where you are now' : t.origin.name } : null);
+    if (!from || !t.to) return;
+    t.from = t.to;
+    t.to = from;
+    t.chosen = null;
+    planTrip();
+  } else if (action === 'preview') {
+    const it = chosenPlan();
+    if (it) previewTrip(it);
+  } else if (action === 'save') saveCommute();
+  else if (action === 'unsave') {
+    commute = null;
+    save(COMMUTE_KEY, null);
+    commuteState = null;
+    renderCommute();
+    renderDetail();
+  } else if (action === 'remind') {
+    if (!commute) return;
+    commute.remind = !commute.remind;
+    save(COMMUTE_KEY, commute);
+    if (commute.remind && 'Notification' in window && Notification.permission === 'default') {
+      Notification.requestPermission().then(() => renderTripPanel());
+    }
+    renderDetail();
+  } else if (action === 'watch') {
+    const id = el.dataset.vehicle;
+    if (!id || !trains.has(id)) return;
+    stopPreview();
+    select({ kind: 'train', id });
+    setCameraMode('follow');
+  }
+}
+
+detailEl.addEventListener('input', (e) => {
+  if ((e.target as HTMLElement).id === 'trip-input') suggestPlaces((e.target as HTMLInputElement).value);
+});
+detailEl.addEventListener('keydown', (e) => {
+  if ((e.target as HTMLElement).id !== 'trip-input') return;
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    const q = placeQuery.trim();
+    const p = placeResults.find((x) => x.kind !== 'here' || !q);
+    // Nothing yet but an address might be: look it up now.
+    if (!p || (q.length >= 3 && p.kind === 'saved')) {
+      if (q.length >= 3) lookUpAddresses(q, placeResults.filter((x) => x.kind === 'station'), true);
+      return;
+    }
+    pickPlace(p.kind === 'here' ? null : p);
+  } else if (e.key === 'Escape' && trip.to) {
+    e.stopPropagation();
+    tripAction('cancel-edit', e.target as HTMLElement);
+  }
+});
+
+// On the map --------------------------------------------------------------------
+
+function drawTrip() {
+  const it = tripActive ? chosenPlan() : null;
+  const tm = tripActive ? chosenTimed() : null;
+  const lines: GeoJSON.Feature[] = [];
+  const points: GeoJSON.Feature[] = [];
+  const pt = (coords: [number, number], role: string, name: string, color = '#ffffff') =>
+    points.push({ type: 'Feature', properties: { role, name, color }, geometry: { type: 'Point', coordinates: coords } });
+  if (it) {
+    it.legs.forEach((leg, i) => {
+      if (leg.kind === 'walk') {
+        lines.push({ type: 'Feature', properties: { kind: 'walk' }, geometry: { type: 'LineString', coordinates: leg.path } });
+        return;
+      }
+      const r = legRoute(leg, tm?.legs[i].run);
+      const color = r ? displayColor(r.color) : '#ffffff';
+      lines.push({ type: 'Feature', properties: { kind: 'ride', color }, geometry: { type: 'LineString', coordinates: leg.path } });
+      const first = i === 0 || it.legs[i - 1].kind === 'walk';
+      pt([leg.board.lng, leg.board.lat], 'stop', first ? `Board ${lineShort(r)}` : `Change to ${lineShort(r)}`, color);
+      pt([leg.alight.lng, leg.alight.lat], 'stop', `Get off · ${leg.alight.name}`, color);
+    });
+    const origin = trip.origin ?? trip.from;
+    if (origin && origin.name !== HERE) pt([origin.lng, origin.lat], 'from', origin.name, '#3b82f6');
+    if (trip.to) pt([trip.to.lng, trip.to.lat], 'to', trip.to.name, '#f43f5e');
+  } else if (tripActive && trip.to) pt([trip.to.lng, trip.to.lat], 'to', trip.to.name, '#f43f5e');
+  source('trip')?.setData({ type: 'FeatureCollection', features: lines });
+  source('trip-points')?.setData({ type: 'FeatureCollection', features: points });
+  applyLayerToggles();
+}
+
+function tripCoords(it: Itinerary) {
+  return it.legs.flatMap((l) => l.path);
+}
+
+function fitTrip() {
+  const it = chosenPlan();
+  if (!it) return;
+  const coords = tripCoords(it);
+  if (trip.to) coords.push([trip.to.lng, trip.to.lat]);
+  if (!coords.length) return;
+  const b = new maplibregl.LngLatBounds(coords[0], coords[0]);
+  for (const c of coords) b.extend(c);
+  if (cameraMode !== 'free') setCameraMode('free');
+  map.fitBounds(b, { padding: 70, pitch: flat() ? 0 : 45, bearing: map.getBearing(), maxZoom: 16.5, duration: 1400 });
+}
+
+// Previewing the trip: the camera travels the whole way, walking legs low and
+// slow, rides higher and quicker, while the panel says what's happening.
+
+let previewing: { raf: number } | null = null;
+
+function previewTrip(it: Itinerary) {
+  stopPreview();
+  // Each leg as local meters, with its distance along.
+  const legs = it.legs
+    .map((leg) => {
+      const pts = leg.path.map(([lng, lat]) => toLocal(lng, lat));
+      const cum = [0];
+      for (let i = 1; i < pts.length; i++) cum.push(cum[i - 1] + Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]));
+      const length = cum[cum.length - 1];
+      const r = leg.kind === 'ride' ? legRoute(leg) : undefined;
+      const label = leg.kind === 'walk' ? `Walk to ${leg.to.name === trip.to?.name ? 'the end' : leg.to.name}` : `${lineName(r)} to ${leg.alight.name}`;
+      // On-screen seconds: walking reads at street level, rides cover ground.
+      const secs = leg.kind === 'walk' ? 2.5 + length / 110 : 3 + length / 900;
+      return { leg, pts, cum, length, label, secs, color: r ? displayColor(r.color) : '#e6e9ef' };
+    })
+    .filter((l) => l.length > 5);
+  if (!legs.length) return;
+  const total = legs.reduce((a, l) => a + l.secs, 0);
+  const scale = Math.min(1, 36 / total);
+  for (const l of legs) l.secs *= scale;
+  const at = (l: (typeof legs)[number], d: number) => {
+    d = Math.max(0, Math.min(l.length, d));
+    let i = 1;
+    while (i < l.cum.length - 1 && l.cum[i] < d) i++;
+    const k = (d - l.cum[i - 1]) / (l.cum[i] - l.cum[i - 1] || 1);
+    return [l.pts[i - 1][0] + (l.pts[i][0] - l.pts[i - 1][0]) * k, l.pts[i - 1][1] + (l.pts[i][1] - l.pts[i - 1][1]) * k];
+  };
+  if (cameraMode !== 'free') setCameraMode('free');
+  let start = 0;
+  let shown = -1;
+  let bearing = map.getBearing();
+  let zoom = map.getZoom();
+  const step = (now: number) => {
+    if (!previewing) return;
+    if (!start) start = now;
+    let t = (now - start) / 1000;
+    let idx = 0;
+    while (idx < legs.length - 1 && t > legs[idx].secs) t -= legs[idx++].secs;
+    const l = legs[idx];
+    const p = Math.min(1, t / l.secs);
+    // Ease in and out of each leg, like a train between stations.
+    const e = p * p * (3 - 2 * p);
+    const d = e * l.length;
+    const [x, y] = at(l, d);
+    const walk = l.leg.kind === 'walk';
+    const [ax, ay] = at(l, d + (walk ? 60 : 350));
+    const [bx, by] = at(l, d - (walk ? 20 : 80));
+    if (Math.hypot(ax - bx, ay - by) > 2) {
+      const target = compass(Math.atan2(ay - by, ax - bx));
+      const delta = ((target - bearing + 540) % 360) - 180;
+      bearing = (bearing + delta * 0.06 + 360) % 360;
+    }
+    zoom += ((walk ? 17 : 15.2) - zoom) * 0.05;
+    map.jumpTo({ center: toLngLat(x, y), bearing, zoom, pitch: flat() ? 0 : walk ? 62 : 55 });
+    if (idx !== shown) {
+      shown = idx;
+      showMatch(`Preview · ${idx + 1} of ${legs.length}`, l.label, [{ label: 'Stop', primary: true, run: () => stopPreview() }], l.color);
+    }
+    if (idx === legs.length - 1 && p >= 1) {
+      stopPreview();
+      fitTrip();
+      return;
+    }
+    previewing.raf = requestAnimationFrame(step);
+  };
+  previewing = { raf: requestAnimationFrame(step) };
+  if (isPhone()) sheet.set('peek');
+}
+
+function stopPreview() {
+  if (!previewing) return;
+  cancelAnimationFrame(previewing.raf);
+  previewing = null;
+  hideMatch();
+  // The sheet tucked away for the preview; bring the steps back.
+  if (isPhone() && selection?.kind === 'trip' && sheet.snap === 'peek') sheet.set('half');
+}
+
+// Hands on the map stop a preview.
+for (const ev of ['pointerdown', 'wheel'] as const) mapEl.addEventListener(ev, () => stopPreview(), { passive: true });
+
+// My commute -----------------------------------------------------------------------
+//
+// One trip saved: where you go, and where from. It's timed from where you
+// are now when location is on (otherwise from where you saved it), and when
+// you're at the far end it turns around to take you back.
+
+interface Commute {
+  to: Place;
+  /** Where it starts: a place you chose, or where you were when you saved it. */
+  home: Place;
+  remind: boolean;
+}
+const COMMUTE_KEY = 'live-boston:commute-trip';
+let commute: Commute | null = load<Commute | null>(COMMUTE_KEY, null);
+if (commute && !commute.to?.name) commute = null;
+/** The live plan for the commute card. */
+let commuteState: { to: Place; from: Place; back: boolean; plans: Itinerary[]; timed: Timed | null; at: number } | null = null;
+let remindedAt = 0;
+
+/** Which way the commute goes from here: out, or back if you're already at the far end. */
+function commuteTarget(origin?: { lng: number; lat: number }) {
+  if (!commute) return null;
+  const back = !!origin && meters(origin, commute.to) < 500;
+  return { to: back ? commute.home : commute.to, back };
+}
+
+function saveCommute() {
+  const t = trip;
+  if (!t.to) return;
+  const origin = t.from ?? t.origin;
+  if (!origin) return;
+  const near = nearestStation(origin);
+  const home: Place = t.from ? t.from : { name: 'Home', detail: near ? `Near ${near.s.name}` : undefined, lng: origin.lng, lat: origin.lat };
+  commute = { to: t.to, home, remind: commute?.remind ?? false };
+  save(COMMUTE_KEY, commute);
+  commuteState = null;
+  shareWithCommute(t);
+  toast('Saved as your commute', `It counts down up top to when to leave. Near ${t.to.name}, it turns around for the trip back.`);
+  renderCommute();
+  renderDetail();
+}
+
+/** The open trip answers the commute card too, saving requests. */
+function shareWithCommute(t: TripState) {
+  if (!commute || !t.plans || !t.to || !t.origin) return;
+  const timed = t.timed?.[0] ?? null;
+  const back = samePlace(t.to, commute.home) && !samePlace(t.to, commute.to);
+  commuteState = { to: t.to, from: t.origin, back, plans: t.plans, timed, at: Date.now() };
   renderCommute();
 }
 
-/** The next departure you can still make on foot, and when to set off. */
-function commutePlan() {
-  if (!commute || !commuteDeps) return null;
-  const walk = commute.walk * 60_000;
-  const now = Date.now();
-  const next = commuteDeps.find((d) => d.at - now >= walk - 30_000);
-  if (!next) return null;
-  return { next, leave: next.at - walk, after: commuteDeps.filter((d) => d.at > next.at).slice(0, 2) };
+let commuteBusy = false;
+async function refreshCommute() {
+  if (!commute || document.hidden || Date.now() < pausedUntil || commuteBusy) return;
+  // The open trip already keeps the same thing fresh.
+  if (selection?.kind === 'trip' && trip.to && !trip.from && commuteState && samePlace(trip.to, commuteState.to)) return;
+  commuteBusy = true;
+  try {
+    // From where you are, if location is already allowed; else from where it starts.
+    let from: Place = commute.home;
+    if (me && Date.now() - me.at < 120_000) from = { name: HERE, lng: me.lng, lat: me.lat };
+    else if (await locationGranted()) {
+      const fix = await whereAmI(10_000);
+      if (fix) from = { name: HERE, lng: fix.lng, lat: fix.lat };
+    }
+    const target = commuteTarget(from)!;
+    const g = await loadGraph();
+    if (!g) return;
+    let st = commuteState;
+    // Plan again on a new start or end, or every ten minutes.
+    if (!st || !samePlace(st.to, target.to) || meters(st.from, from) > 150 || Date.now() - st.at > 600_000) {
+      const plans = g.plan(from, target.to);
+      st = commuteState = { to: target.to, from, back: target.back, plans, timed: null, at: Date.now() };
+      // The walking part counts for when to leave.
+      await Promise.all(plans.slice(0, 2).map(routeWalks));
+    }
+    // The best two ways, timed (the second less often); the soonest arrival wins.
+    const timed: Timed[] = [];
+    for (const [i, p] of st.plans.slice(0, 2).entries()) timed.push(await timePlan(p, i ? 180_000 : 25_000));
+    if (commuteState === st) st.timed = timed.sort((a, b) => a.arrive - b.arrive)[0] ?? null;
+  } catch (err) {
+    if (err instanceof RateLimited) handleError(err, '');
+    else console.warn(err);
+  } finally {
+    commuteBusy = false;
+  }
+  renderCommute();
 }
 
 let commuteHtml = '';
 function renderCommute() {
-  commuteEl.hidden = !commute;
+  commuteEl.hidden = false;
+  commuteEl.classList.toggle('where', !commute);
   sheetEl.classList.toggle('has-commute', !!commute);
-  if (!commute) return;
-  const route = network?.routes.get(commute.routeId);
-  const line = route ? (route.type === 3 ? route.short : route.name.replace(' Line', '')) : '';
-  const plan = commutePlan();
-  let side = '<small>Leave in</small><b>…</b>';
-  let state = '';
-  if (commuteDeps && !plan) side = '<small>No more</small><b>—</b>';
-  else if (plan) {
-    const leaveIn = plan.leave - Date.now();
-    if (leaveIn <= 60_000) {
-      side = '<small>Leave</small><b>now</b>';
-      state = ' go';
-    } else {
-      const m = Math.round(leaveIn / 60_000);
-      side = `<small>Leave in</small><b>${leaveIn >= 3_600_000 ? clockFmt.format(plan.leave) : `${m}<i>min</i>`}</b>`;
-      state = m <= 5 ? ' soon' : '';
+  let html: string;
+  let color = '#3b82f6';
+  if (!commute) {
+    html = `<span class="where-icon">${ICON.search}</span>
+      <span class="commute-text"><strong>Where to?</strong><span>Directions by T and on foot</span></span>
+      <span class="where-go">${ICON.chevronRight}</span>`;
+  } else {
+    const st = commuteState;
+    const tm = st?.timed ?? null;
+    const it = tm?.itin ?? st?.plans[0] ?? null;
+    const firstRide = tm ? tm.itin.legs.findIndex((l) => l.kind === 'ride') : -1;
+    const ride = firstRide >= 0 ? (tm!.itin.legs[firstRide] as RideLeg) : null;
+    const run = ride ? tm!.legs[firstRide].run : undefined;
+    const route = ride ? legRoute(ride, run) : undefined;
+    if (route) color = displayColor(route.color);
+    const to = st?.to ?? commute.to;
+    const chips = it
+      ? it.legs
+          .map((l, i) =>
+            l.kind === 'walk'
+              ? `<i class="chip-walk">${ICON.walk}${Math.max(1, Math.round(l.seconds / 60))}</i>`
+              : `<i class="chip-line" style="--c:${(() => {
+                  const r = legRoute(l, tm?.legs[i].run);
+                  return r ? displayColor(r.color) : '#777';
+                })()}">${escape(lineShort(legRoute(l, tm?.legs[i].run)))}</i>`,
+          )
+          .join('<i class="chip-sep">›</i>')
+      : '';
+    let side = '<small>Leave in</small><b>…</b>';
+    let state = '';
+    let line = st && !st.plans.length ? 'No way by T from here' : 'Checking times…';
+    if (tm) {
+      const leaveIn = tm.leave - Date.now();
+      if (leaveIn <= 60_000) {
+        side = '<small>Leave</small><b>now</b>';
+        state = ' go';
+      } else {
+        const m = Math.round(leaveIn / 60_000);
+        side = `<small>Leave in</small><b>${leaveIn >= 3_600_000 ? clockFmt.format(tm.leave) : `${m}<i>min</i>`}</b>`;
+        state = m <= 5 ? ' soon' : '';
+      }
+      line = `Arrive ${clockFmt.format(tm.arrive)}${run && ride ? ` · ${lineShort(route)} at ${clockFmt.format(run.board)} from ${ride.board.name}` : ''}`;
     }
+    html = `<span class="card-bar"></span>
+      <span class="commute-text">
+        <small>${ICON.pinOn}${st?.back ? 'Heading back' : 'My commute'} · to ${escape(to.name)}</small>
+        <strong class="chips">${chips || escape(`To ${to.name}`)}</strong>
+        <span>${escape(line)}</span>
+      </span>
+      <span class="commute-side${state}">${side}</span>`;
   }
-  const html = `<span class="card-bar"></span>
-    <span class="commute-text">
-      <small>${ICON.pinOn}${escape(line)} · ${escape(commute.stationName)}</small>
-      <strong>To ${escape(commute.headsign)}</strong>
-      <span>${plan ? `Departs ${clockFmt.format(plan.next.at)}${plan.after.length ? ` · then ${plan.after.map((d) => clockFmt.format(d.at)).join(', ')}` : ''}` : commuteDeps ? 'Nothing predicted right now' : 'Checking times…'}</span>
-    </span>
-    <span class="commute-side${state}">${side}</span>`;
   // Redrawn every second for the countdown; skip the DOM when nothing changed.
   if (html !== commuteHtml) {
     commuteHtml = html;
     commuteEl.innerHTML = html;
-    commuteEl.style.setProperty('--c', route ? displayColor(route.color) : '#777');
+    commuteEl.style.setProperty('--c', color);
+    commuteEl.setAttribute('aria-label', commute ? 'My commute' : 'Where to? Get directions');
   }
-}
-
-function pinCommute(stationId: string, key: string) {
-  const s = stations.find((x) => x.id === stationId);
-  const [routeId, headsign] = key.split(/\|(.*)/);
-  if (!s || !routeId) return;
-  const same = commute?.stationId === stationId && commute.routeId === routeId && commute.headsign === headsign;
-  if (same) {
-    changeCommute('clear');
-    return;
-  }
-  commute = { stationId, stationName: s.name, routeId, headsign, walk: commute?.walk ?? 5, remind: commute?.remind ?? false };
-  save(COMMUTE_KEY, commute);
-  commuteDeps = null;
-  if (departures) setCommuteDepartures(departures);
-  const route = network?.routes.get(routeId);
-  toast('Pinned as your commute', `${route?.name ?? ''} to ${headsign} from ${s.name}. It counts down up top.`);
-  renderCommute();
-  renderDetail();
-  sheet.set(sheet.snap, false);
-}
-
-async function changeCommute(action: string) {
-  if (!commute) return;
-  if (action === 'clear') {
-    commute = null;
-    commuteDeps = null;
-    save(COMMUTE_KEY, null);
-  } else if (action === 'walk-up' || action === 'walk-down') {
-    commute.walk = Math.max(0, Math.min(45, commute.walk + (action === 'walk-up' ? 1 : -1)));
-  } else if (action === 'remind') {
-    commute.remind = !commute.remind;
-    if (commute.remind && 'Notification' in window && Notification.permission === 'default') {
-      await Notification.requestPermission();
-    }
-  }
-  if (commute) save(COMMUTE_KEY, commute);
-  renderCommute();
-  renderDetail();
-  sheet.set(sheet.snap, false);
 }
 
 function reminderNote() {
@@ -3191,16 +4119,19 @@ function reminderNote() {
 }
 
 function remindIfTime() {
-  if (!commute?.remind) return;
-  const plan = commutePlan();
-  if (!plan) return;
-  const leaveIn = plan.leave - Date.now();
+  const tm = commuteState?.timed;
+  if (!commute?.remind || !tm) return;
+  const leaveIn = tm.leave - Date.now();
   // Once per departure: a fresh reminder only after a few quiet minutes.
   if (leaveIn > 60_000 || leaveIn < -90_000 || Date.now() - remindedAt < 5 * 60_000) return;
   remindedAt = Date.now();
-  const route = network?.routes.get(commute.routeId);
-  const title = `Time to leave for ${commute.stationName}`;
-  const body = `${route?.name ?? 'Your train'} to ${commute.headsign} departs at ${clockFmt.format(plan.next.at)}. ${commute.walk} min walk.`;
+  const i = tm.itin.legs.findIndex((l) => l.kind === 'ride');
+  const ride = i >= 0 ? (tm.itin.legs[i] as RideLeg) : null;
+  const run = ride ? tm.legs[i].run : undefined;
+  const title = `Time to leave for ${commuteState!.to.name}`;
+  const body = ride
+    ? `${lineName(legRoute(ride, run))} from ${ride.board.name} at ${clockFmt.format(tm.legs[i].start)}. You’ll arrive about ${clockFmt.format(tm.arrive)}.`
+    : `You’ll arrive about ${clockFmt.format(tm.arrive)}.`;
   toast(title, body, true);
   notify(title, body);
 }
@@ -3219,9 +4150,16 @@ async function notify(title: string, body: string) {
 }
 
 commuteEl.addEventListener('click', () => {
-  if (!commute) return;
   closeSearch();
-  select({ kind: 'station', id: commute.stationId });
+  if (!commute) {
+    openTrip();
+    return;
+  }
+  const st = commuteState;
+  const to = st?.to ?? commute.to;
+  // From where you are when that's what it's timed from; otherwise from its start.
+  const from = st && st.from.name !== HERE ? st.from : null;
+  openTrip(to, from);
 });
 
 let toastTimer: number | undefined;
@@ -3270,6 +4208,13 @@ const locateEl = $('#locate');
 const matchEl = $('#match');
 
 function toggleLocate() {
+  // On quietly for directions: the button now asks to be shown, not to stop.
+  if (watchId != null && quietLocate && me) {
+    quietLocate = false;
+    if (!riding()) map.easeTo({ center: [me.lng, me.lat], zoom: Math.max(map.getZoom(), 15), duration: 1400 });
+    offerNearestStation();
+    return;
+  }
   if (watchId != null) {
     navigator.geolocation.clearWatch(watchId);
     watchId = null;
@@ -3280,12 +4225,20 @@ function toggleLocate() {
     locateEl.classList.remove('on', 'waiting');
     locateEl.setAttribute('aria-pressed', 'false');
     hideMatch();
+    settleWaiters(null);
     return;
   }
   if (!('geolocation' in navigator)) {
     toast('Location isn’t available', 'This browser can’t share where you are.');
     return;
   }
+  startLocate(false);
+}
+
+/** Starts following your position. Quietly (for directions), it doesn't fly the map to you. */
+function startLocate(quiet: boolean) {
+  if (watchId != null) return;
+  quietLocate = quiet;
   firstFix = true;
   locateEl.classList.add('on', 'waiting');
   locateEl.setAttribute('aria-pressed', 'true');
@@ -3294,9 +4247,10 @@ function toggleLocate() {
 
 function onFixError(err: GeolocationPositionError) {
   if (err.code === err.PERMISSION_DENIED) {
-    toast('Location is off for this site', 'Allow location for Live Boston in your browser’s settings to see where you are.');
+    locationDenied = true;
+    if (!quietLocate) toast('Location is off for this site', 'Allow location for Live Boston in your browser’s settings to see where you are.');
     toggleLocate();
-  } else if (firstFix) {
+  } else if (firstFix && !quietLocate) {
     toast('Still looking for you', 'No GPS fix yet. It works best outside or above ground.');
   }
 }
@@ -3332,11 +4286,15 @@ function onFix(pos: GeolocationPosition) {
   // Circle radius at zoom 0, in pixels: meters over meters-per-pixel (512 px tiles).
   const r0 = (accuracy * 512) / (40_075_016.7 * Math.cos((lat * Math.PI) / 180));
   source('me')?.setData({ type: 'FeatureCollection', features: [{ type: 'Feature', properties: { r0 }, geometry: { type: 'Point', coordinates: [lng, lat] } }] });
+  locationDenied = false;
   if (firstFix) {
     firstFix = false;
-    if (!riding()) map.easeTo({ center: [lng, lat], zoom: Math.max(map.getZoom(), 15), duration: 1400 });
-    offerNearestStation();
+    if (!quietLocate) {
+      if (!riding()) map.easeTo({ center: [lng, lat], zoom: Math.max(map.getZoom(), 15), duration: 1400 });
+      offerNearestStation();
+    }
   }
+  settleWaiters(me);
   findMyTrain();
 }
 
