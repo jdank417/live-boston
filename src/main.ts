@@ -3807,8 +3807,8 @@ function renderTrip(target: HTMLElement = detailEl) {
     body = `${summary}
       ${journeyBar(plan, tm)}
       <div class="actions trip-actions">
-        <button class="btn primary" data-trip="preview">${ICON.play}Preview the trip</button>
-        ${isCommute ? '' : `<button class="btn" data-trip="save">${ICON.pin}Make it my commute</button>`}
+        <button class="btn primary" data-trip="preview">${ICON.play}<span class="wide-only">Preview the trip</span><span class="narrow-only">Preview</span></button>
+        ${isCommute ? '' : `<button class="btn" data-trip="save">${ICON.pin}<span class="wide-only">Make it my commute</span><span class="narrow-only">Save commute</span></button>`}
       </div>
       ${commuteBox}
       ${stepsHtml(plan, tm)}

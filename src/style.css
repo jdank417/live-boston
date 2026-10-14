@@ -2276,6 +2276,25 @@ button.od-row:hover {
   margin-top: 14px;
 }
 
+.trip-actions .btn {
+  white-space: nowrap;
+}
+
+.narrow-only {
+  display: none;
+}
+
+/* Small phones: shorter labels, so each button stays on one line. */
+@media (max-width: 360px) {
+  .wide-only {
+    display: none;
+  }
+
+  .narrow-only {
+    display: inline;
+  }
+}
+
 /* Step by step */
 
 .steps {
