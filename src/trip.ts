@@ -41,6 +41,8 @@ export interface RideLeg {
   /** Every route with a trip from board to alight (Green branches, commuter rail lines sharing track). */
   routes: string[];
   stops: number;
+  /** The stations it passes on the way, between boarding and getting off. */
+  via: Station[];
   /** Typical ride time, before live times are known. */
   seconds: number;
   path: [number, number][];
@@ -378,6 +380,7 @@ export class TransitGraph {
       pattern: seq.pattern,
       routes: [...routes],
       stops: a - b,
+      via: seq.stations.slice(b + 1, a),
       seconds: seq.at[a] - seq.at[b],
       path,
     };

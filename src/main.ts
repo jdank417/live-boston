@@ -222,6 +222,12 @@ const LINE_KINDS = ['ferry', 'bus', 'rail', 'subway'] as const;
 const LINE_OPACITY = { ferry: 0.75, bus: 0.85, rail: 0.85, subway: 1 };
 /** Disruptions: suspended stretches, closed stations, bunched trains. */
 const AMBER = '#fbbf24';
+const STATION_STROKE = ['case', ['get', 'ferry'], '#22b8cf', ['get', 'rail'], '#e3a6d8', ['get', 'bus'], '#b4bec6', '#ffffff'] as any;
+const STATION_LABEL = ['case', ['get', 'major'], '#e6e9ef', '#a3abb8'] as any;
+/** Everything that isn't your trip, while directions are shown. */
+const MUTED = '#3b4049';
+const MUTED_BODY = new Color('#4a4f58');
+const MUTED_ACCENT = new Color('#5a606a');
 
 /** A train you follow, with enough to describe it while it's out of service. */
 interface Followed {
@@ -539,7 +545,7 @@ function addLayers() {
         ['case', ['get', 'major'], 7, 5],
       ],
       'circle-color': PALETTE.background,
-      'circle-stroke-color': ['case', ['get', 'ferry'], '#22b8cf', ['get', 'rail'], '#e3a6d8', ['get', 'bus'], '#b4bec6', '#ffffff'],
+      'circle-stroke-color': STATION_STROKE,
       'circle-stroke-width': ['interpolate', ['linear'], ['zoom'], 10, 1, 17, 2.5],
       'circle-opacity': show(14.5) as any,
       'circle-stroke-opacity': show(14.5) as any,
@@ -590,11 +596,11 @@ function addLayers() {
     id: 'vehicle-rings',
     type: 'circle',
     source: 'vehicles',
-    filter: ['any', ['get', 'selected'], ['get', 'followed'], ['get', 'bunched']],
+    filter: ['any', ['get', 'selected'], ['get', 'mine'], ['all', ['!', ['get', 'dim']], ['any', ['get', 'followed'], ['get', 'bunched']]]],
     paint: {
       'circle-radius': ['interpolate', ['linear'], ['zoom'], 9, 6, 15, 12],
       'circle-color': 'rgba(0,0,0,0)',
-      'circle-stroke-color': ['case', ['get', 'selected'], '#ffffff', ['get', 'followed'], '#ffc94d', AMBER],
+      'circle-stroke-color': ['case', ['any', ['get', 'selected'], ['get', 'mine']], '#ffffff', ['get', 'followed'], '#ffc94d', AMBER],
       'circle-stroke-width': 2,
       'circle-stroke-opacity': fadeOut(1) as any,
     },
@@ -603,6 +609,8 @@ function addLayers() {
     id: 'vehicles',
     type: 'circle',
     source: 'vehicles',
+    // Your trip's trains draw over the greyed-out rest.
+    layout: { 'circle-sort-key': ['case', ['get', 'dim'], 0, 1] },
     paint: {
       'circle-radius': [
         'interpolate',
@@ -615,7 +623,7 @@ function addLayers() {
         15,
         ['case', ['get', 'small'], 5, 7],
       ],
-      'circle-color': ['get', 'color'],
+      'circle-color': ['case', ['get', 'dim'], MUTED, ['get', 'color']],
       'circle-stroke-color': PALETTE.background,
       'circle-stroke-width': 1.5,
       'circle-opacity': fadeOut(1) as any,
@@ -697,10 +705,10 @@ function addLayers() {
     type: 'circle',
     source: 'trip-points',
     paint: {
-      'circle-radius': ['match', ['get', 'role'], 'to', 9, 'from', 7, 6],
-      'circle-color': ['match', ['get', 'role'], 'stop', '#ffffff', ['get', 'color']],
-      'circle-stroke-color': ['match', ['get', 'role'], 'stop', ['get', 'color'], '#ffffff'],
-      'circle-stroke-width': ['match', ['get', 'role'], 'stop', 3.5, 2.5],
+      'circle-radius': ['match', ['get', 'role'], 'to', 9, 'from', 7, 'pass', ['interpolate', ['linear'], ['zoom'], 11, 2.5, 15, 4.5], 6],
+      'circle-color': ['match', ['get', 'role'], ['stop', 'pass'], '#ffffff', ['get', 'color']],
+      'circle-stroke-color': ['match', ['get', 'role'], ['stop', 'pass'], ['get', 'color'], '#ffffff'],
+      'circle-stroke-width': ['match', ['get', 'role'], 'stop', 3.5, 'pass', 2, 2.5],
       'circle-pitch-alignment': 'viewport',
     },
   });
@@ -711,15 +719,15 @@ function addLayers() {
     layout: {
       'text-field': ['get', 'name'],
       'text-font': ['Noto Sans Bold'],
-      'text-size': 12.5,
-      'text-offset': [0, -1.4],
-      'text-anchor': 'bottom',
+      'text-size': ['match', ['get', 'role'], 'pass', 10.5, 12.5],
+      'text-offset': ['match', ['get', 'role'], 'pass', ['literal', [0.9, 0]], ['literal', [0, -1.4]]],
+      'text-anchor': ['match', ['get', 'role'], 'pass', 'left', 'bottom'],
       'text-max-width': 12,
       'text-allow-overlap': false,
-      'symbol-sort-key': ['match', ['get', 'role'], 'to', 0, 'stop', 1, 2],
+      'symbol-sort-key': ['match', ['get', 'role'], 'to', 0, 'stop', 1, 'from', 2, 3],
     },
     paint: {
-      'text-color': '#f3f5f8',
+      'text-color': ['match', ['get', 'role'], 'pass', '#c3c9d3', '#f3f5f8'],
       'text-halo-color': PALETTE.background,
       'text-halo-width': 2,
     },
@@ -741,7 +749,7 @@ function addLayers() {
       'symbol-sort-key': ['case', ['get', 'major'], 0, 1],
     },
     paint: {
-      'text-color': ['case', ['get', 'major'], '#e6e9ef', '#a3abb8'],
+      'text-color': STATION_LABEL,
       'text-halo-color': PALETTE.background,
       'text-halo-width': 1.6,
       'text-opacity': show(15.5) as any,
@@ -844,13 +852,21 @@ function applyLayerToggles() {
   document.body.dataset.weather = layers.weather ? weather.kind : 'clear';
   if (!map.getLayer('speed-lines')) return;
   const vis = (on: boolean) => (on ? 'visible' : 'none');
-  map.setLayoutProperty('speed-lines', 'visibility', vis(layers.speed));
-  for (const id of ['bikes', 'bike-counts']) map.setLayoutProperty(id, 'visibility', vis(layers.bikes));
-  // Lines step back behind the speed map, and behind a trip being shown.
-  const showingTrip = tripActive && !!chosenPlan();
-  for (const kind of LINE_KINDS)
-    map.setPaintProperty(`${kind}-lines`, 'line-opacity', layers.speed ? 0.15 : showingTrip ? LINE_OPACITY[kind] * 0.35 : LINE_OPACITY[kind]);
-  for (const id of ['alert-lines', 'alert-stations']) map.setLayoutProperty(id, 'visibility', vis(layers.alerts));
+  // Directions shown: everything but the trip greys out or steps aside, so
+  // the way you're going is unmistakable.
+  const focus = !!tripFocus;
+  map.setLayoutProperty('speed-lines', 'visibility', vis(layers.speed && !focus));
+  for (const id of ['bikes', 'bike-counts']) map.setLayoutProperty(id, 'visibility', vis(layers.bikes && !focus));
+  map.setLayoutProperty('arrivals', 'visibility', vis(!focus));
+  // Lines step back behind the speed map, and go grey behind a trip.
+  for (const kind of LINE_KINDS) {
+    map.setPaintProperty(`${kind}-lines`, 'line-color', focus ? MUTED : ['get', 'color']);
+    map.setPaintProperty(`${kind}-lines`, 'line-opacity', focus ? 0.7 : layers.speed ? 0.15 : LINE_OPACITY[kind]);
+  }
+  map.setPaintProperty('stations', 'circle-stroke-color', focus ? MUTED : STATION_STROKE);
+  map.setPaintProperty('station-labels', 'text-color', focus ? '#565c66' : STATION_LABEL);
+  map.setFilter('station-labels', focus && tripStations.length ? ['!', ['in', ['get', 'id'], ['literal', tripStations]]] : null);
+  for (const id of ['alert-lines', 'alert-stations']) map.setLayoutProperty(id, 'visibility', vis(layers.alerts && !focus));
   $('#speed-legend').hidden = !layers.speed;
   if (layers.speed) drawSpeedMap();
   if (layers.bikes && Date.now() - docksAt > BIKES_MS) refreshDocks();
@@ -1399,6 +1415,8 @@ function exaggeration(zoom: number) {
 }
 
 function layout(train: Train, s: ReturnType<typeof exaggeration>, now: number, selected: boolean, starred: boolean) {
+  // Directions shown: trains you won't ride go grey.
+  const dim = !!tripFocus && !tripFocus.has(train.v.id) && !selected;
   const front = { x: 0, y: 0 };
   const back = { x: 0, y: 0 };
   const half = (train.length * s.length) / 2;
@@ -1435,10 +1453,10 @@ function layout(train: Train, s: ReturnType<typeof exaggeration>, now: number, s
       length: len,
       width: spec.width * s.width,
       height: spec.height * s.height,
-      body: train.bodies[i],
-      accent: train.accent,
+      body: dim ? MUTED_BODY : train.bodies[i],
+      accent: dim ? MUTED_ACCENT : train.accent,
       selected,
-      followed: starred,
+      followed: starred && !dim,
       // Boats rock gently even at rest.
       roll: spec.boat ? 0.02 * Math.sin(now / 900 + train.phase) : sway * Math.sin(now / 480 + train.phase + i * 0.8),
       boat: spec.boat,
@@ -1495,6 +1513,8 @@ function drawDots(selectedId: string | null) {
         followed: isFollowed(t.v.id),
         bunched: bunched.has(t.v.id),
         small: t.route.type >= 2,
+        mine: !!tripFocus?.has(t.v.id),
+        dim: !!tripFocus && !tripFocus.has(t.v.id) && t.v.id !== selectedId,
       },
       geometry: { type: 'Point', coordinates: toLngLat(t.x, t.y) },
     });
@@ -3827,9 +3847,16 @@ detailEl.addEventListener('keydown', (e) => {
 
 // On the map --------------------------------------------------------------------
 
+/** While directions are shown: the trains you'd ride, which keep their color as the rest goes grey. */
+let tripFocus: Set<string> | null = null;
+/** Stations the trip labels itself, so the map's own labels for them step aside. */
+let tripStations: string[] = [];
+
 function drawTrip() {
   const it = tripActive ? chosenPlan() : null;
   const tm = tripActive ? chosenTimed() : null;
+  tripFocus = it ? new Set((tm?.legs ?? []).map((l) => l.run?.vehicleId).filter((id): id is string => !!id)) : null;
+  tripStations = (it?.legs ?? []).flatMap((l) => (l.kind === 'ride' ? [l.board, ...l.via, l.alight].map((s) => s.id) : []));
   const lines: GeoJSON.Feature[] = [];
   const points: GeoJSON.Feature[] = [];
   const pt = (coords: [number, number], role: string, name: string, color = '#ffffff') =>
@@ -3843,6 +3870,8 @@ function drawTrip() {
       const r = legRoute(leg, tm?.legs[i].run);
       const color = r ? displayColor(r.color) : '#ffffff';
       lines.push({ type: 'Feature', properties: { kind: 'ride', color }, geometry: { type: 'LineString', coordinates: leg.path } });
+      // Each stop on the way, to count them off.
+      for (const v of leg.via) pt([v.lng, v.lat], 'pass', v.name, color);
       const first = i === 0 || it.legs[i - 1].kind === 'walk';
       pt([leg.board.lng, leg.board.lat], 'stop', first ? `Board ${lineShort(r)}` : `Change to ${lineShort(r)}`, color);
       pt([leg.alight.lng, leg.alight.lat], 'stop', `Get off · ${leg.alight.name}`, color);
