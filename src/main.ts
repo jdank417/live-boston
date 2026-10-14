@@ -296,7 +296,7 @@ interface Train {
 
 const trains = new Map<string, Train>();
 const debugJumps: number[] = [];
-if (import.meta.env.DEV) Object.assign(window, { map, trains, speeds, debugJumps, toLngLat });
+if (import.meta.env.DEV) Object.assign(window, { map, trains, speeds, debugJumps, toLngLat, gps: () => ({ me, alongside: [...alongside] }) });
 let lastUpdate = 0;
 let pausedUntil = 0;
 const colorCache = new Map<string, Color>();
@@ -611,6 +611,34 @@ function addLayers() {
 
   // Trains draw above the lines and stations, below the labels.
   map.addLayer(trainLayer);
+
+  // You, when you've asked to be located: a blue dot in a circle as wide as
+  // the fix is uncertain. The circle's radius is in meters, so it scales
+  // with the zoom (×2 per level), from its size at zoom 0.
+  map.addSource('me', { type: 'geojson', data: empty() });
+  map.addLayer({
+    id: 'me-accuracy',
+    type: 'circle',
+    source: 'me',
+    paint: {
+      'circle-radius': ['interpolate', ['exponential', 2], ['zoom'], 0, ['get', 'r0'], 24, ['*', ['get', 'r0'], 2 ** 24]],
+      'circle-color': 'rgba(59, 130, 246, 0.12)',
+      'circle-stroke-color': 'rgba(59, 130, 246, 0.4)',
+      'circle-stroke-width': 1,
+      'circle-pitch-alignment': 'map',
+    },
+  });
+  map.addLayer({
+    id: 'me',
+    type: 'circle',
+    source: 'me',
+    paint: {
+      'circle-radius': 7,
+      'circle-color': '#3b82f6',
+      'circle-stroke-color': '#ffffff',
+      'circle-stroke-width': 2.5,
+    },
+  });
 
   map.addLayer({
     id: 'station-labels',
@@ -1412,7 +1440,8 @@ function driveCamera(now: number) {
   if (touring && now > tourNext) nextTourStop();
   // Never steer while someone has their hands on the map: moving the camera
   // resets MapLibre's gesture handlers, so a pinch or twist could never start.
-  const busy = handsOn(now);
+  // In the cab, dragging looks around (handled below), so the camera keeps riding.
+  const busy = cameraMode === 'cab' ? false : handsOn(now);
   if (wasBusy && !busy && riding()) {
     // They turned to look around; keep that view for a moment.
     rideLook = (((map.getBearing() - rideBearing + 540) % 360) - 180);
@@ -1475,10 +1504,21 @@ function driveCab(t: Train, now: number, dt: number) {
   const target = compass(Math.atan2(ahead.y - eye.y, ahead.x - eye.x));
   const delta = ((target - rideBearing + 540) % 360) - 180;
   rideBearing = (rideBearing + delta * (1 - Math.exp(-dt / 0.45)) + 360) % 360;
-  if (now - lookedAt > 4000) rideLook *= Math.exp(-dt / 1.2);
+  // Where you've looked stays put until "Look ahead" eases it back.
+  if (lookingAhead) {
+    const k = Math.exp(-dt / 0.25);
+    rideLook *= k;
+    cabTilt *= k;
+    if (Math.abs(rideLook) < 0.3 && Math.abs(cabTilt) < 0.3) {
+      rideLook = cabTilt = 0;
+      lookingAhead = false;
+    }
+    showLooking();
+  }
+  const pitch = CAB_PITCH + cabTilt;
   // A driver's eyes sit about three quarters of the way up the cab; a ferry's bridge is up top.
   const height = lead.boat ? lead.height * 1.15 : lead.height * 0.78;
-  const cam = map.calculateCameraOptionsFromCameraLngLatAltRotation(toLngLat(eye.x, eye.y), height, rideBearing + rideLook, CAB_PITCH);
+  const cam = map.calculateCameraOptionsFromCameraLngLatAltRotation(toLngLat(eye.x, eye.y), height, rideBearing + rideLook, pitch);
   if (cabFrom) {
     // Glide in from wherever the camera was, rather than cutting.
     const k = Math.min(1, (now - cabFrom.at) / 1800);
@@ -1487,7 +1527,7 @@ function driveCab(t: Train, now: number, dt: number) {
     const turn = ((cam.bearing! - cabFrom.bearing + 540) % 360) - 180;
     cam.center = [cabFrom.center.lng + (to.lng - cabFrom.center.lng) * e, cabFrom.center.lat + (to.lat - cabFrom.center.lat) * e];
     cam.zoom = cabFrom.zoom + (cam.zoom! - cabFrom.zoom) * e;
-    cam.pitch = cabFrom.pitch + (CAB_PITCH - cabFrom.pitch) * e;
+    cam.pitch = cabFrom.pitch + (pitch - cabFrom.pitch) * e;
     cam.bearing = cabFrom.bearing + turn * e;
     if (k >= 1) cabFrom = null;
   }
@@ -1537,7 +1577,8 @@ for (const type of ['pointerup', 'pointercancel', 'pointerleave'] as const) {
 function spin(degrees: number) {
   const now = performance.now();
   lastInteraction = now;
-  if (riding()) {
+  if (cameraMode === 'cab') lookAround(degrees, 0);
+  else if (riding()) {
     rideLook = (((rideLook + degrees + 540) % 360) - 180);
     lookedAt = now;
     map.setBearing(rideBearing + rideLook);
@@ -1606,6 +1647,60 @@ mapEl.addEventListener('gestureend', (e) => {
   gestureFrom = null;
 });
 
+// Looking around from the cab: drag with a finger or the mouse to turn and
+// to look up or down, or twist with two fingers. The map's own drag, twist and
+// zoom would pull the camera off the train, so they're off while in the cab.
+
+/** Degrees above (+) or below (−) the usual view from the cab. */
+let cabTilt = 0;
+let lookingAhead = false;
+const cabTouches = new Map<number, { x: number; y: number }>();
+
+function setCabControls(on: boolean) {
+  for (const handler of [map.dragPan, map.dragRotate, map.touchZoomRotate, map.touchPitch, map.scrollZoom, map.doubleClickZoom, map.keyboard]) {
+    if (on) handler.disable();
+    else handler.enable();
+  }
+  cabTouches.clear();
+}
+
+/** Turn and tilt the view from the cab, in degrees. */
+function lookAround(turn: number, tilt: number) {
+  lookingAhead = false;
+  rideLook = ((((rideLook + turn) % 360) + 540) % 360) - 180;
+  // Up to just under level: past that MapLibre can't place the camera this close to the ground.
+  cabTilt = Math.max(-26, Math.min(2, cabTilt + tilt));
+  lookedAt = performance.now();
+  showLooking();
+}
+
+function showLooking() {
+  hudEl.classList.toggle('looking', cameraMode === 'cab' && (Math.abs(rideLook) > 4 || Math.abs(cabTilt) > 3));
+}
+
+const twist = (a: { x: number; y: number }, b: { x: number; y: number }) => (Math.atan2(b.y - a.y, b.x - a.x) * 180) / Math.PI;
+
+mapEl.addEventListener('pointerdown', (e) => {
+  if (cameraMode !== 'cab') return;
+  cabTouches.set(e.pointerId, { x: e.clientX, y: e.clientY });
+});
+addEventListener('pointermove', (e) => {
+  const was = cabTouches.get(e.pointerId);
+  if (cameraMode !== 'cab' || !was) return;
+  const now = { x: e.clientX, y: e.clientY };
+  if (cabTouches.size === 1) {
+    // Grab the view: drag right to look left, drag down to look up.
+    lookAround(-(now.x - was.x) * 0.3, (now.y - was.y) * 0.12);
+  } else if (cabTouches.size === 2) {
+    const other = [...cabTouches.entries()].find(([id]) => id !== e.pointerId)![1];
+    const delta = ((twist(other, now) - twist(other, was) + 540) % 360) - 180;
+    lookAround(-delta, 0);
+  }
+  cabTouches.set(e.pointerId, now);
+});
+for (const type of ['pointerup', 'pointercancel'] as const) addEventListener(type, (e) => cabTouches.delete(e.pointerId));
+
+
 function setCameraMode(mode: CameraMode) {
   const was = cameraMode;
   cameraMode = mode;
@@ -1615,6 +1710,10 @@ function setCameraMode(mode: CameraMode) {
   updatePadding(true);
   if (mode === 'cab') {
     // The cab view looks nearly level and sits a few meters off the ground.
+    rideLook = 0;
+    cabTilt = 0;
+    lookingAhead = false;
+    setCabControls(true);
     map.setMaxPitch(85);
     map.setMaxZoom(24);
     const c = map.getCenter();
@@ -1623,6 +1722,9 @@ function setCameraMode(mode: CameraMode) {
     map.stop();
   } else if (was === 'cab') {
     cabFrom = null;
+    setCabControls(false);
+    cabTilt = 0;
+    hudEl.classList.remove('looking');
     // Lift out of the cab before putting the limits back, or the view snaps.
     map.once('moveend', () => {
       if (cameraMode === 'cab') return;
@@ -2390,6 +2492,8 @@ function updatePadding(immediate = false) {
   // Layout position, not the on-screen one: the sidebar may be mid-slide.
   const left = !cinematic && !phone ? Math.max(0, sheetEl.offsetLeft + sheetEl.offsetWidth) : 0;
   const bottom = !cinematic && phone ? Math.min(sheet.height, innerHeight * 0.6) : 0;
+  // Cards that float above the sheet on phones sit just over it.
+  document.documentElement.style.setProperty('--peek', `${phone ? sheet.height : 0}px`);
   const now = map.getPadding();
   if (Math.abs((now.left ?? 0) - left) < 1 && Math.abs((now.bottom ?? 0) - bottom) < 1) return;
   // Setting padding stops any camera animation, so wait for it to land.
@@ -2617,7 +2721,11 @@ function renderDock(id: string) {
     <p class="fine">${d.capacity} docks · reported <span data-ago="${d.reportedAt}">${ago(d.reportedAt)}</span></p>`;
 }
 
-/** The caption bar while riding along: line, destination, next stop, speed. */
+/** Whether the ride-along panel shows the train's next stops. */
+const HUD_KEY = 'live-boston:hud-open';
+let hudOpen = load(HUD_KEY, false);
+
+/** The panel while riding along: line, destination, next stop, speed, and on request the stops ahead. */
 function renderHud() {
   const t = selection?.kind === 'train' && riding() ? trains.get(selection.id) : undefined;
   hudEl.hidden = !t;
@@ -2625,28 +2733,50 @@ function renderHud() {
   const next = upcoming?.[0];
   const speed = mph(t);
   const cab = cameraMode === 'cab';
+  const stopped = t.v.status === 'STOPPED_AT';
+  const speedText = stopped ? '0' : speed != null ? `${speed}` : '—';
+  const where = escape(t.v.stopName ?? '—');
+  const stops = !hudOpen
+    ? ''
+    : upcoming?.length
+      ? `<ol class="hud-stops">${upcoming
+          .slice(0, 6)
+          .map((s) => `<li><span>${escape(s.name)}</span><time data-at="${s.at}">${countdown(s.at)}</time></li>`)
+          .join('')}</ol>`
+      : `<p class="hud-stops empty">${upcoming ? 'No arrival times for this one right now.' : 'Loading the stops ahead…'}</p>`;
   hudEl.style.setProperty('--c', hex(t));
+  hudEl.classList.toggle('open', hudOpen);
   hudEl.innerHTML = `
-    <div class="hud-id">
-      <span class="dot"></span>
-      <div><small>${escape(t.route.name)}</small><strong>To ${escape(destination(t))}</strong></div>
-    </div>
-    <div class="hud-cell"><small>${t.v.status === 'STOPPED_AT' ? 'Stopped at' : 'Next stop'}</small><strong>${escape(t.v.stopName ?? '—')}</strong></div>
-    ${next ? `<div class="hud-cell"><small>Arrives</small><strong data-at="${next.at}">${countdown(next.at)}</strong></div>` : ''}
-    <div class="hud-cell"><small>Speed</small><strong>${
-      t.v.status === 'STOPPED_AT' ? '0 <em>mph</em>' : speed != null ? `${speed} <em>mph</em>` : '—'
-    }</strong></div>
-    <div class="hud-tools">
-      ${touring ? `<button class="hud-btn" data-action="skip">Next <span data-tour-left></span></button>` : ''}
-      ${
-        flat()
-          ? ''
-          : `<button class="hud-btn" data-action="${cab ? 'ride' : 'cab'}" title="${cab ? 'Watch from behind' : 'Look out from the front'}">${
-              cab ? ICON.chase : ICON.cab
-            }<span>${cab ? 'Chase' : 'Cab'}</span></button>`
-      }
-      <button class="hud-btn exit" data-action="exit-ride" aria-label="Stop riding">${ICON.close}<span>Exit</span></button>
+    ${stops}
+    <div class="hud-main">
+      <button class="hud-id" data-action="hud-toggle" aria-expanded="${hudOpen}" title="${hudOpen ? 'Hide' : 'Show'} the stops ahead">
+        <span class="dot"></span>
+        <span class="hud-name">
+          <small>${escape(t.route.name)}</small>
+          <strong>To ${escape(destination(t))}</strong>
+          <span class="hud-sum">${stopped ? 'At' : 'Next'} ${where}${next ? ` · <span data-at="${next.at}">${countdown(next.at)}</span>` : ''} · ${speedText} mph</span>
+        </span>
+        <span class="hud-chev">${ICON.chevron}</span>
+      </button>
+      <div class="hud-cells">
+        <div class="hud-cell"><small>${stopped ? 'Stopped at' : 'Next stop'}</small><strong>${where}</strong></div>
+        ${next ? `<div class="hud-cell"><small>Arrives</small><strong data-at="${next.at}">${countdown(next.at)}</strong></div>` : ''}
+        <div class="hud-cell"><small>Speed</small><strong>${speedText} <em>mph</em></strong></div>
+      </div>
+      <div class="hud-tools">
+        ${cab ? `<button class="hud-btn look" data-action="look-ahead" title="Look down the line again">${ICON.chase}<span>Look ahead</span></button>` : ''}
+        ${touring ? `<button class="hud-btn" data-action="skip">Next <span data-tour-left></span></button>` : ''}
+        ${
+          flat()
+            ? ''
+            : `<button class="hud-btn" data-action="${cab ? 'ride' : 'cab'}" title="${cab ? 'Watch from behind' : 'Look out from the front'}" aria-label="${
+                cab ? 'Chase view' : 'Cab view'
+              }">${cab ? ICON.chase : ICON.cab}<span>${cab ? 'Chase' : 'Cab'}</span></button>`
+        }
+        <button class="hud-btn exit" data-action="exit-ride" aria-label="Stop riding">${ICON.close}<span>Exit</span></button>
+      </div>
     </div>`;
+  showLooking();
 }
 
 function toggleFollow(id: string) {
@@ -2733,6 +2863,12 @@ sheetEl.addEventListener('click', (e) => {
 hudEl.addEventListener('click', (e) => {
   const action = (e.target as HTMLElement).closest<HTMLElement>('[data-action]')?.dataset.action;
   if (action === 'skip') nextTourStop();
+  if (action === 'hud-toggle') {
+    hudOpen = !hudOpen;
+    save(HUD_KEY, hudOpen);
+    renderHud();
+  }
+  if (action === 'look-ahead') lookingAhead = true;
   if (action === 'cab') setCameraMode('cab');
   if (action === 'ride') setCameraMode('ride');
   if (action === 'exit-ride') exitRide();
@@ -3101,6 +3237,213 @@ toastEl.addEventListener('click', () => toastEl.classList.add('out'));
 toastEl.addEventListener('animationend', (e) => {
   if ((e as AnimationEvent).animationName.startsWith('toast-out')) toastEl.hidden = true;
 });
+
+// Where you are ------------------------------------------------------------------
+//
+// The locate button follows your phone's position. Standing still, it shows
+// the nearest station. On the move, it watches for a train that stays with
+// you, fix after fix, heading your way, and offers to ride along with it.
+// GPS drops out underground, so this works where the train runs in the open.
+
+interface Fix {
+  x: number;
+  y: number;
+  lng: number;
+  lat: number;
+  /** Meters, the radius the fix is good to. */
+  accuracy: number;
+  /** m/s and compass degrees, measured by the phone or from the last fix. */
+  speed: number | null;
+  heading: number | null;
+  at: number;
+}
+let me: Fix | null = null;
+/** The last several fixes, to measure speed and direction over a few seconds rather than one noisy hop. */
+const trail: Fix[] = [];
+let watchId: number | null = null;
+let firstFix = true;
+/** Trains close to you, and for how many fixes in a row. */
+const alongside = new Map<string, number>();
+const notMine = new Set<string>();
+let offered: string | null = null;
+const locateEl = $('#locate');
+const matchEl = $('#match');
+
+function toggleLocate() {
+  if (watchId != null) {
+    navigator.geolocation.clearWatch(watchId);
+    watchId = null;
+    me = null;
+    trail.length = 0;
+    alongside.clear();
+    source('me')?.setData(empty());
+    locateEl.classList.remove('on', 'waiting');
+    locateEl.setAttribute('aria-pressed', 'false');
+    hideMatch();
+    return;
+  }
+  if (!('geolocation' in navigator)) {
+    toast('Location isn’t available', 'This browser can’t share where you are.');
+    return;
+  }
+  firstFix = true;
+  locateEl.classList.add('on', 'waiting');
+  locateEl.setAttribute('aria-pressed', 'true');
+  watchId = navigator.geolocation.watchPosition(onFix, onFixError, { enableHighAccuracy: true, maximumAge: 3000, timeout: 30_000 });
+}
+
+function onFixError(err: GeolocationPositionError) {
+  if (err.code === err.PERMISSION_DENIED) {
+    toast('Location is off for this site', 'Allow location for Live Boston in your browser’s settings to see where you are.');
+    toggleLocate();
+  } else if (firstFix) {
+    toast('Still looking for you', 'No GPS fix yet. It works best outside or above ground.');
+  }
+}
+
+function onFix(pos: GeolocationPosition) {
+  const { latitude: lat, longitude: lng, accuracy, speed, heading } = pos.coords;
+  const [x, y] = toLocal(lng, lat);
+  const at = pos.timestamp;
+  // Phones often leave out speed and heading; work them out from where you
+  // were a few seconds ago, which rides out the jitter in each fix.
+  while (trail.length && at - trail[0].at > 15_000) trail.shift();
+  const from = [...trail].reverse().find((f) => at - f.at >= 3000) ?? trail[0];
+  const dt = from ? (at - from.at) / 1000 : 0;
+  const moved = from ? Math.hypot(x - from.x, y - from.y) : 0;
+  const measured = from && dt > 0.5 && moved > accuracy ? moved / dt : from && dt >= 3 ? 0 : null;
+  me = {
+    x,
+    y,
+    lng,
+    lat,
+    accuracy,
+    speed: speed != null && speed >= 0 ? speed : measured,
+    heading:
+      heading != null && !Number.isNaN(heading) && (speed ?? 0) > 1
+        ? heading
+        : measured && from
+          ? compass(Math.atan2(y - from.y, x - from.x))
+          : null,
+    at,
+  };
+  trail.push(me);
+  locateEl.classList.remove('waiting');
+  // Circle radius at zoom 0, in pixels: meters over meters-per-pixel (512 px tiles).
+  const r0 = (accuracy * 512) / (40_075_016.7 * Math.cos((lat * Math.PI) / 180));
+  source('me')?.setData({ type: 'FeatureCollection', features: [{ type: 'Feature', properties: { r0 }, geometry: { type: 'Point', coordinates: [lng, lat] } }] });
+  if (firstFix) {
+    firstFix = false;
+    if (!riding()) map.easeTo({ center: [lng, lat], zoom: Math.max(map.getZoom(), 15), duration: 1400 });
+    offerNearestStation();
+  }
+  findMyTrain();
+}
+
+function offerNearestStation() {
+  if (!me) return;
+  const here = me;
+  let best: { s: Station; d: number } | null = null;
+  for (const s of stations) {
+    const [sx, sy] = toLocal(s.lng, s.lat);
+    const d = Math.hypot(sx - here.x, sy - here.y);
+    if (!best || d < best.d) best = { s, d };
+  }
+  if (!best || best.d > 3000) {
+    toast('Found you', 'You’re a way from the nearest station.');
+    return;
+  }
+  const s = best.s;
+  const minutes = Math.max(1, Math.round(best.d / 1.3 / 60));
+  showMatch(
+    'Nearest station',
+    `${s.name} · ${minutes} min walk`,
+    [
+      { label: 'Departures', primary: true, run: () => select({ kind: 'station', id: s.id }) },
+      { label: 'Close', run: () => {} },
+    ],
+    displayColor(s.rail ? '#80276C' : s.ferry ? '#008EAA' : '#ffffff'),
+  );
+}
+
+/** Where a train is now, along its track or on its glide. */
+function trainPoint(t: Train) {
+  return t.track ? t.track.at(t.d) : { x: t.x, y: t.y };
+}
+
+function findMyTrain() {
+  const here = me;
+  if (!here) return;
+  const moving = here.speed != null && here.speed > 3;
+  // Close enough to be on board: the fix's uncertainty, plus half a train.
+  let best: { t: Train; d: number; n: number } | null = null;
+  for (const t of trains.values()) {
+    const p = trainPoint(t);
+    const d = Math.hypot(p.x - here.x, p.y - here.y);
+    const reach = Math.min(400, Math.max(60, here.accuracy * 1.5)) + t.length / 2;
+    const facing = !moving || here.heading == null || Math.abs(((compass(t.heading) - here.heading + 540) % 360) - 180) < 60;
+    if (d > reach || !facing) {
+      alongside.delete(t.v.id);
+      continue;
+    }
+    // Moving together counts; a pause at a station alongside it keeps the count.
+    const n = (alongside.get(t.v.id) ?? 0) + (moving ? 1 : 0);
+    if (!n) continue;
+    alongside.set(t.v.id, n);
+    if (!best || n > best.n || (n === best.n && d < best.d)) best = { t, d, n };
+  }
+  // A few moving fixes in a row together, and it's yours.
+  if (!moving || !best || best.n < 3) return;
+  const t = best.t;
+  if (notMine.has(t.v.id) || offered === t.v.id) return;
+  if (selection?.kind === 'train' && selection.id === t.v.id && riding()) return;
+  offered = t.v.id;
+  showMatch(
+    `Looks like you’re on the ${t.route.name}`,
+    `To ${destination(t)} · ${vehicleLabel(t)}`,
+    [
+      {
+        label: 'Ride along',
+        primary: true,
+        run: () => {
+          select({ kind: 'train', id: t.v.id });
+          setCameraMode('ride');
+        },
+      },
+      { label: 'Not this one', run: () => notMine.add(t.v.id) },
+    ],
+    hex(t),
+  );
+}
+
+let matchActions: (() => void)[] = [];
+function showMatch(title: string, body: string, actions: { label: string; primary?: boolean; run: () => void }[], color: string) {
+  matchActions = actions.map((a) => a.run);
+  matchEl.style.setProperty('--c', color);
+  matchEl.innerHTML = `
+    <span class="dot"></span>
+    <div class="match-text"><strong>${escape(title)}</strong><span>${escape(body)}</span></div>
+    <div class="match-actions">${actions
+      .map((a, i) => `<button class="btn small${a.primary ? ' light' : ''}" data-match="${i}">${escape(a.label)}</button>`)
+      .join('')}</div>`;
+  matchEl.hidden = false;
+  matchEl.classList.remove('out');
+}
+
+function hideMatch() {
+  if (!matchEl.hidden) matchEl.classList.add('out');
+}
+
+matchEl.addEventListener('click', (e) => {
+  const i = (e.target as HTMLElement).closest<HTMLElement>('[data-match]')?.dataset.match;
+  if (i == null) return;
+  hideMatch();
+  matchActions[Number(i)]?.();
+});
+matchEl.addEventListener('animationend', (e) => {
+  if (/^(toast|tip)-out/.test((e as AnimationEvent).animationName)) matchEl.hidden = true;
+});
+locateEl.addEventListener('click', toggleLocate);
 
 // Map controls
 $('#zoom-in').addEventListener('click', () => map.zoomIn());

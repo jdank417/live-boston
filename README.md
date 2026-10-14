@@ -27,8 +27,13 @@ Boston in real time: every T, commuter rail, Silver Line, ferry and Amtrak train
   optional reminder while the app is open
 - **Installable**: add it to your home screen as an app, with rich link previews
 - **Ride along** steps the interface aside and follows a train with a minimal
-  caption bar, or switch to the **cab view** to look down the line from the
-  driver's seat; **Take the tour** hops between trains on its own
+  panel (tap the line's name for the stops ahead), or switch to the **cab
+  view** to look down the line from the driver's seat, dragging to look
+  around; **Take the tour** hops between trains on its own
+- **Find me**: the locate button shows where you are and the nearest station,
+  and on the move it spots the train you're riding (one that stays with you,
+  fix after fix, going your way) and offers to ride along. GPS drops out
+  underground, so this works where trains run in the open
 - **Spin the city** with two fingers: twist on a touchscreen, or swipe
   sideways on a trackpad (any browser; a real twist works in Safari too).
   While riding along, spinning looks around, then eases back behind the train

@@ -2046,6 +2046,76 @@ h2 small {
   transition: transform 0.2s;
 }
 
+#locate.on {
+  color: #60a5fa;
+}
+
+#locate.waiting svg {
+  animation: locating 1.2s var(--ease) infinite;
+}
+
+@keyframes locating {
+  50% {
+    opacity: 0.35;
+  }
+}
+
+/* "Looks like you're on…" and the nearest station. */
+#match {
+  position: fixed;
+  z-index: 8;
+  bottom: 28px;
+  left: calc(50% + 204px);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  max-width: min(560px, calc(100% - 440px));
+  padding: 12px 12px 12px 16px;
+  border-radius: 18px;
+  background: var(--surface);
+  backdrop-filter: blur(28px) saturate(1.5);
+  -webkit-backdrop-filter: blur(28px) saturate(1.5);
+  border: 1px solid color-mix(in srgb, var(--c) 45%, var(--line-strong));
+  box-shadow: 0 24px 60px -12px rgba(0, 0, 0, 0.6);
+  transform: translateX(-50%);
+  animation: tip-in 0.6s var(--spring) both;
+}
+
+#match.out {
+  animation: toast-out 0.35s var(--ease) both;
+}
+
+.match-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.match-text strong {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.match-text span {
+  font-size: 12.5px;
+  color: var(--text-2);
+}
+
+.match-actions {
+  display: flex;
+  flex: none;
+  gap: 6px;
+}
+
+/* Riding along, the panel sits at the bottom; the card goes above it, centered on the map. */
+body.cinematic #match {
+  left: 50%;
+  bottom: 120px;
+  max-width: calc(100% - 32px);
+}
+
 body.cinematic #map-controls {
   opacity: 0;
   pointer-events: none;
@@ -2093,9 +2163,9 @@ body.cab::after {
   left: 50%;
   bottom: 28px;
   display: flex;
-  align-items: center;
+  flex-direction: column;
   max-width: calc(100% - 32px);
-  padding: 8px 8px 8px 18px;
+  padding: 8px;
   border-radius: 20px;
   transform: translateX(-50%);
   animation: hud-in 0.6s var(--ease) both;
@@ -2108,11 +2178,114 @@ body.cab::after {
   }
 }
 
+.hud-main {
+  display: flex;
+  align-items: center;
+}
+
 .hud-id {
   display: flex;
   align-items: center;
   gap: 12px;
-  padding-right: 18px;
+  min-width: 0;
+  padding: 6px 14px 6px 10px;
+  border: 0;
+  border-radius: 14px;
+  background: none;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.hud-id:hover {
+  background: var(--fill-hover);
+}
+
+.hud-name {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.hud-name small,
+.hud-name strong,
+.hud-sum {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The one-line summary stands in for the cells on a phone. */
+.hud-sum {
+  display: none;
+  margin-top: 2px;
+  font-size: 12.5px;
+  color: var(--text-2);
+  font-variant-numeric: tabular-nums;
+}
+
+.hud-chev {
+  flex: none;
+  color: var(--text-3);
+}
+
+.hud-chev svg {
+  width: 14px;
+  height: 14px;
+  /* Closed, it points up: the stops open above. */
+  transform: rotate(180deg);
+  transition: transform 0.3s var(--ease);
+}
+
+#hud.open .hud-chev svg {
+  transform: none;
+}
+
+.hud-cells {
+  display: flex;
+}
+
+.hud-stops {
+  list-style: none;
+  max-height: 38vh;
+  margin: 2px 4px 6px;
+  padding: 4px 10px 8px;
+  overflow-y: auto;
+  border-bottom: 1px solid var(--line);
+  animation: rise 0.35s var(--ease) both;
+}
+
+.hud-stops li {
+  display: flex;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 6px 0;
+  font-size: 14px;
+}
+
+.hud-stops li:first-child span {
+  font-weight: 600;
+}
+
+.hud-stops time {
+  color: var(--text-2);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.hud-stops.empty {
+  font-size: 13px;
+  color: var(--text-2);
+}
+
+/* "Look ahead" shows only once you've looked away in the cab. */
+.hud-btn.look {
+  display: none;
+}
+
+#hud.looking .hud-btn.look {
+  display: inline-flex;
 }
 
 .hud-id small,
@@ -2386,10 +2559,70 @@ body.cab::after {
     right: 12px;
     bottom: calc(12px + env(safe-area-inset-bottom));
     transform: none;
-    flex-wrap: wrap;
-    row-gap: 10px;
-    padding: 14px 12px 12px 16px;
+    padding: 8px;
     animation-name: hud-in-phone;
+  }
+
+  .hud-main {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    row-gap: 10px;
+  }
+
+  .hud-id {
+    padding: 6px 6px 6px 8px;
+  }
+
+  .hud-sum {
+    display: block;
+  }
+
+  #hud.open .hud-sum {
+    display: none;
+  }
+
+  .hud-cells {
+    grid-column: 1 / -1;
+    padding: 0 8px 4px;
+  }
+
+  #hud:not(.open) .hud-cells {
+    display: none;
+  }
+
+  /* Icons only, to leave the line's name room. */
+  .hud-btn > span:not([data-tour-left]) {
+    display: none;
+  }
+
+  #match {
+    left: 12px;
+    right: 12px;
+    bottom: calc(12px + env(safe-area-inset-bottom));
+    max-width: none;
+    flex-wrap: wrap;
+    transform: none;
+    animation-name: toast-in-phone;
+  }
+
+  #match.out {
+    animation-name: toast-out-phone;
+  }
+
+  .match-actions {
+    flex: 1 0 100%;
+    justify-content: flex-end;
+  }
+
+  /* Above the sheet's peek, or the ride-along panel. */
+  #match {
+    bottom: calc(var(--peek, 200px) + 12px);
+  }
+
+  body.cinematic #match {
+    left: 12px;
+    bottom: calc(150px + env(safe-area-inset-bottom));
   }
 
   @keyframes hud-in-phone {
@@ -2397,11 +2630,6 @@ body.cab::after {
       opacity: 0;
       transform: translateY(16px);
     }
-  }
-
-  .hud-id {
-    flex: 1 0 100%;
-    padding: 0;
   }
 
   .hud-cell {
@@ -2420,10 +2648,10 @@ body.cab::after {
     text-overflow: ellipsis;
   }
 
+  /* Always beside the name, whether or not the details are open below. */
   .hud-tools {
-    position: absolute;
-    top: 10px;
-    right: 10px;
+    grid-row: 1;
+    grid-column: 2;
     margin: 0;
   }
 
