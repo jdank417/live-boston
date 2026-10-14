@@ -409,7 +409,7 @@ function addLayers() {
   map.addSource('lines', { type: 'geojson', data: empty() });
   const widths = { ferry: [0.8, 2.4], subway: [1.6, 6], rail: [1, 3.6], bus: [0.8, 3] } as const;
   const width = (lo: number, hi: number, pad = 0) =>
-    ['interpolate', ['exponential', 1.5], ['zoom'], 9, lo + pad / 2, 17, hi + pad, 18, hi * 1.4 + pad, 20, hi * 5 + pad, 22, hi * 22 + pad] as any;
+    ['interpolate', ['exponential', 1.5], ['zoom'], 9, lo + pad / 2, 17, hi + pad, 18, hi * 1.4 + pad, 20, hi * 3.5 + pad, 22, hi * 11 + pad] as any;
   for (const kind of LINE_KINDS) {
     const [lo, hi] = widths[kind];
     // Ferries cross open water, where a casing would only darken it.
@@ -1491,7 +1491,9 @@ function driveCab(t: Train, now: number, dt: number) {
     cam.bearing = cabFrom.bearing + turn * e;
     if (k >= 1) cabFrom = null;
   }
-  map.jumpTo(cam);
+  // Spell out every field: a `roll: undefined` from the helper is read as a
+  // real value, and MapLibre's matrix math then throws.
+  map.jumpTo({ center: cam.center, zoom: cam.zoom, bearing: cam.bearing, pitch: cam.pitch, roll: 0 });
 }
 
 // ---------------------------------------------------------------------------
