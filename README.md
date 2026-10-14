@@ -1,6 +1,6 @@
 # Live Boston
 
-Boston in real time: every T, commuter rail and Silver Line vehicle in 3D, Bluebikes, and the city's real sky and weather.
+Boston in real time: every T, commuter rail, Silver Line, ferry and Amtrak train in 3D, with service alerts, your commute, Bluebikes, and the city's real sky and weather.
 
 **[jdank417.github.io/live-boston](https://jdank417.github.io/live-boston/)**
 
@@ -9,11 +9,26 @@ Boston in real time: every T, commuter rail and Silver Line vehicle in 3D, Blueb
   actual number of cars the MBTA reports, true car dimensions and lit windows.
   Cars follow the curves of their own track, and trains hidden by buildings or
   underground show through as a faint outline
-- One sidebar (a draggable bottom sheet on phones) with three tabs: **Lines**
-  with live counts, toggles and tap-to-zoom; **Following**, for trains you've
-  starred; and **Map**, for 2D/3D, layers and today's sunrise and sunset
+- **Ferries and Amtrak**: MBTA harbor ferries as boats, and Amtrak trains near
+  Boston (from [Amtraker](https://amtraker.com)) running on the commuter rail
+  tracks they share, with how late each one is
+- One sidebar (a draggable bottom sheet on phones) with four tabs: **Lines**
+  with live counts, toggles and disruption flags; **Alerts**; **Following**,
+  for trains you've starred; and **Map**, for 2D/3D, layers, getting the app,
+  and today's sunrise and sunset
+- **Alerts**: the MBTA's service alerts, worst first, with suspended stretches
+  and closed stations marked in amber on the map. Outside causes (freight
+  trains, drawbridges, Amtrak traffic, rough seas) are called out, and
+  **bunched trains** running nose to tail are worked out from live positions
+- **Search** stations, lines, any train by number, ferries by name and
+  Bluebikes docks. Press `/` on a keyboard
+- **My commute**: pin a departure from any station and the top of the sidebar
+  counts down to when you need to leave, allowing for your walk, with an
+  optional reminder while the app is open
+- **Installable**: add it to your home screen as an app, with rich link previews
 - **Ride along** steps the interface aside and follows a train with a minimal
-  caption bar; **Take the tour** hops between trains on its own
+  caption bar, or switch to the **cab view** to look down the line from the
+  driver's seat; **Take the tour** hops between trains on its own
 - **Spin the city** with two fingers: twist on a touchscreen, or swipe
   sideways on a trackpad (any browser; a real twist works in Safari too).
   While riding along, spinning looks around, then eases back behind the train
@@ -25,7 +40,7 @@ Boston in real time: every T, commuter rail and Silver Line vehicle in 3D, Blueb
 - A quiet custom basemap, light that follows the real sun over Boston, and live
   weather (rain, snow, fog, storms). Preview with `?hour=21.5` or `?weather=snow`
 - Link straight to a train (`#train=<vehicle id>`), a station
-  (`#station=place-pktrm`) or your list (`#following`)
+  (`#station=place-pktrm`), your list (`#following`) or the alerts (`#alerts`)
 
 ## How accurate is it?
 
