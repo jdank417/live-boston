@@ -2803,7 +2803,12 @@ function searchItems(): SearchItem[] {
       boost: 6,
     });
   }
+  // Silver Line stops come in pairs, one per direction, with the same name; list each name once.
+  const listed = new Set<string>();
   for (const s of stations) {
+    const key = `${s.name}|${s.rail}|${s.bus}|${s.ferry}`;
+    if (listed.has(key)) continue;
+    listed.add(key);
     items.push({
       kind: 'station',
       id: s.id,
@@ -3215,7 +3220,7 @@ function showSpinTip() {
   tip.addEventListener('click', hide);
   setTimeout(hide, 7000);
   tip.addEventListener('animationend', (e) => {
-    if ((e as AnimationEvent).animationName === 'tip-out') tip.hidden = true;
+    if (/^(tip|toast)-out/.test((e as AnimationEvent).animationName)) tip.hidden = true;
   });
 }
 

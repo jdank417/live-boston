@@ -1,3 +1,6 @@
 node_modules
 dist
 .DS_Store
+
+# Local secrets, such as an MBTA API key for development
+*.local

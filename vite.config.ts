@@ -6,7 +6,7 @@ export default defineConfig({
   build: {
     // MapLibre and three.js are big on their own; ship them as separate,
     // long-cached chunks so an app change doesn't re-download them.
-    chunkSizeWarningLimit: 1000,
+    chunkSizeWarningLimit: 1200,
     rollupOptions: {
       output: {
         manualChunks: { maplibre: ['maplibre-gl'], three: ['three'] },
